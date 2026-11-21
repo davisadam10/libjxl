@@ -451,6 +451,9 @@ struct JxlDecoder {
   bool sparse_mode_active;
   std::map<size_t, SparseSectionData> sparse_sections;
   size_t sparse_bytes_buffered;
+  uint64_t bytes_skipped_sequential;
+  uint64_t sparse_bytes_received;
+  uint64_t sparse_peak_bytes_buffered;
   JxlExperimentalRegionDecodeStats last_region_stats;
 
   // For extra channels. Empty if no extra channels are requested, and they are
@@ -632,6 +635,12 @@ struct JxlDecoder {
     sparse_mode_active = false;
     sparse_sections.clear();
     sparse_bytes_buffered = 0;
+  }
+
+  void ResetFrameStreamingStats() {
+    bytes_skipped_sequential = 0;
+    sparse_bytes_received = 0;
+    sparse_peak_bytes_buffered = 0;
   }
 
   void AdvanceCodestream(size_t size) {
@@ -835,6 +844,7 @@ void RewindDecodingState(JxlDecoder* dec) {
   dec->frame_data_file_offset = 0;
   dec->frame_data_file_offset_valid = false;
   dec->ClearSparseInput();
+  dec->ResetFrameStreamingStats();
   memset(&dec->last_region_stats, 0, sizeof(dec->last_region_stats));
   dec->last_region_stats.fallback_reason = JXL_EXP_FALLBACK_NO_REGION;
   dec->is_last_of_still = false;
@@ -1141,6 +1151,15 @@ void PopulateRegionStats(const JxlDecoder* dec,
   stats->scale_mode = ToExperimentalScaleMode(fd_stats.scale_mode);
   stats->total_passes = fd_stats.total_passes;
   stats->required_passes = fd_stats.required_passes;
+  stats->bytes_skipped_sequential = dec->bytes_skipped_sequential;
+  stats->sparse_bytes_received = dec->sparse_bytes_received;
+  stats->sparse_peak_bytes_buffered = dec->sparse_peak_bytes_buffered;
+  stats->is_partial_fidelity =
+      (stats->scale_mode == JXL_EXP_SCALE_MODE_NATIVE_VARDCT_DC ||
+       stats->scale_mode == JXL_EXP_SCALE_MODE_MODULAR_SQUEEZE_NATIVE ||
+       stats->scale_mode == JXL_EXP_SCALE_MODE_PROGRESSIVE_PASS_SKIP)
+          ? JXL_TRUE
+          : JXL_FALSE;
 
   std::vector<jxl::FrameDecoder::ByteRange> cs_ranges;
   dec->frame_dec->GetRequiredCodestreamRanges(/*coalesce_adjacent=*/true,
@@ -1323,6 +1342,52 @@ JxlDecoderStatus JxlDecoderExperimentalGetRequiredInputRanges(
   return JXL_DEC_SUCCESS;
 }
 
+JxlDecoderStatus JxlDecoderExperimentalGetNextRequiredOffset(
+    const JxlDecoder* dec, uint64_t* offset, uint64_t* length) {
+  if (!dec || !offset || !length) {
+    return JXL_API_ERROR("Invalid arguments");
+  }
+  if (!dec->frame_dec || dec->frame_stage == FrameStage::kHeader) {
+    return JXL_API_ERROR("Frame header and TOC not yet parsed");
+  }
+  if (!dec->frame_data_file_offset_valid) {
+    return JXL_API_ERROR(
+        "Cannot map TOC sections to file offsets for this container layout");
+  }
+  const auto& toc = dec->frame_dec->Toc();
+  const auto& offsets = dec->frame_dec->SectionCodestreamOffsets();
+  bool found = false;
+  uint64_t cur_off = 0;
+  uint64_t cur_len = 0;
+  for (size_t i = 0; i < toc.size(); ++i) {
+    const size_t sz = toc[i].size;
+    if (sz == 0) continue;
+    if (i < dec->section_processed.size() && dec->section_processed[i]) {
+      continue;
+    }
+    if (!dec->frame_dec->IsSectionRequiredPlanned(toc[i].id)) continue;
+    auto it = dec->sparse_sections.find(i);
+    if (it != dec->sparse_sections.end() && it->second.complete) continue;
+    if (dec->frame_data_file_offset + offsets[i] <
+        dec->frame_data_file_offset) {
+      return JXL_API_ERROR("File offset overflow");
+    }
+    const uint64_t file_off = dec->frame_data_file_offset + offsets[i];
+    if (!found) {
+      cur_off = file_off;
+      cur_len = sz;
+      found = true;
+    } else if (cur_off + cur_len == file_off) {
+      cur_len += sz;
+    } else {
+      break;
+    }
+  }
+  *offset = found ? cur_off : 0;
+  *length = found ? cur_len : 0;
+  return JXL_DEC_SUCCESS;
+}
+
 JxlDecoderStatus JxlDecoderExperimentalSetInputAtOffset(JxlDecoder* dec,
                                                         const uint8_t* data,
                                                         size_t size,
@@ -1332,6 +1397,11 @@ JxlDecoderStatus JxlDecoderExperimentalSetInputAtOffset(JxlDecoder* dec,
   }
   if (!dec->frame_dec || dec->frame_stage == FrameStage::kHeader) {
     return JXL_API_ERROR("Frame header and TOC not yet parsed");
+  }
+  if (dec->next_in != nullptr || dec->avail_in > 0) {
+    return JXL_API_ERROR(
+        "Must call JxlDecoderReleaseInput before switching to sparse offset "
+        "input");
   }
   if (!dec->frame_data_file_offset_valid) {
     return JXL_API_ERROR(
@@ -1347,6 +1417,7 @@ JxlDecoderStatus JxlDecoderExperimentalSetInputAtOffset(JxlDecoder* dec,
   }
   dec->sparse_mode_active = true;
   if (size == 0) return JXL_DEC_SUCCESS;
+  dec->sparse_bytes_received += size;
 
   const uint64_t in_start = offset;
   const uint64_t in_end = offset + size;
@@ -1374,6 +1445,9 @@ JxlDecoderStatus JxlDecoderExperimentalSetInputAtOffset(JxlDecoder* dec,
       }
       entry.data.resize(sec_size);
       dec->sparse_bytes_buffered += sec_size;
+      if (dec->sparse_bytes_buffered > dec->sparse_peak_bytes_buffered) {
+        dec->sparse_peak_bytes_buffered = dec->sparse_bytes_buffered;
+      }
     }
     if (!entry.complete) {
       memcpy(entry.data.data() + dst_off, data + src_off, copy_len);
@@ -1660,6 +1734,9 @@ JxlDecoderStatus JxlDecoderProcessSections(JxlDecoder* dec) {
   while (dec->next_section < toc.size() &&
          (dec->section_processed[dec->next_section] == 1 ||
           !dec->frame_dec->IsSectionRequired(toc[dec->next_section].id))) {
+    if (dec->section_processed[dec->next_section] == 0) {
+      dec->bytes_skipped_sequential += toc[dec->next_section].size;
+    }
     dec->section_processed[dec->next_section] = 1;
     prefix_skip_bytes += toc[dec->next_section].size;
     ++dec->next_section;
@@ -1685,6 +1762,7 @@ JxlDecoderStatus JxlDecoderProcessSections(JxlDecoder* dec) {
     size_t size = toc[i].size;
     if (!dec->frame_dec->IsSectionRequired(id)) {
       dec->section_processed[i] = 1;
+      dec->bytes_skipped_sequential += size;
       pos += size;
       continue;
     }
@@ -1733,6 +1811,9 @@ JxlDecoderStatus JxlDecoderProcessSections(JxlDecoder* dec) {
   while (dec->next_section < dec->section_processed.size() &&
          (dec->section_processed[dec->next_section] == 1 ||
           !dec->frame_dec->IsSectionRequired(toc[dec->next_section].id))) {
+    if (dec->section_processed[dec->next_section] == 0) {
+      dec->bytes_skipped_sequential += toc[dec->next_section].size;
+    }
     dec->section_processed[dec->next_section] = 1;
     completed_prefix_bytes += toc[dec->next_section].size;
     ++dec->next_section;
@@ -1865,6 +1946,7 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
             dec->frame_data_file_offset + dec->remaining_frame_size <=
                 dec->box_contents_end));
       dec->ClearSparseInput();
+      dec->ResetFrameStreamingStats();
       ApplyDecodeRegionToFrameDecoder(dec);
 
       dec->frame_stage = FrameStage::kTOC;
@@ -2057,11 +2139,17 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
       if (!all_sections_done) {
         // Not all sections have been processed yet
         if (dec->sparse_mode_active) {
+          if (dec->input_closed) {
+            return JXL_INPUT_ERROR("incomplete sparse input");
+          }
           return JXL_DEC_NEED_MORE_INPUT;
         }
         return dec->RequestMoreInput();
       }
 
+      if (!dec->sparse_mode_active && dec->remaining_frame_size > 0) {
+        dec->bytes_skipped_sequential += dec->remaining_frame_size;
+      }
       PopulateRegionStats(dec, &dec->last_region_stats);
 
       if (dec->sparse_mode_active) {
@@ -2134,6 +2222,10 @@ JxlDecoderStatus JxlDecoderSetInput(JxlDecoder* dec, const uint8_t* data,
                                     size_t size) {
   if (dec->next_in) {
     return JXL_API_ERROR("already set input, use JxlDecoderReleaseInput first");
+  }
+  if (dec->sparse_mode_active) {
+    return JXL_API_ERROR(
+        "cannot call JxlDecoderSetInput while sparse offset input is active");
   }
   if (dec->input_closed) {
     return JXL_API_ERROR("input already closed");

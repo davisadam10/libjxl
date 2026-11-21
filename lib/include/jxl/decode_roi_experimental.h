@@ -129,6 +129,16 @@ typedef struct {
   size_t total_passes;
   /** Number of passes required/decoded for the configured scale target. */
   size_t required_passes;
+  /** Total compressed bytes skipped zero-copy in sequential streaming mode. */
+  uint64_t bytes_skipped_sequential;
+  /** Total compressed bytes ingested via sparse offset-tagged input. */
+  uint64_t sparse_bytes_received;
+  /** Peak simultaneous bytes buffered in sparse section assembly. */
+  uint64_t sparse_peak_bytes_buffered;
+  /** JXL_TRUE if the frame completed via an approximate/reduced-fidelity fast
+   * path (VarDCT 1:8 DC, Modular Squeeze partial inverse, or progressive pass
+   * skip); JXL_FALSE for full-fidelity or exact reference resample. */
+  JXL_BOOL is_partial_fidelity;
 } JxlExperimentalRegionDecodeStats;
 
 /**
@@ -249,8 +259,31 @@ JXL_EXPORT JxlDecoderStatus JxlDecoderExperimentalGetRequiredInputRanges(
     size_t* range_count);
 
 /**
+ * Queries the next single coalesced file byte range required to advance
+ * decoding of the current frame (aligned with upstream issue #5143).
+ *
+ * Shares the exact same TOC/dependency backend as
+ * @ref JxlDecoderExperimentalGetRequiredInputRanges without requiring the
+ * caller to allocate a range array. When all required sections are already
+ * buffered or decoded, sets `*length = 0` and returns ::JXL_DEC_SUCCESS.
+ *
+ * @param dec decoder object
+ * @param offset [out] byte offset from the start of the original file/stream
+ * @param length [out] number of bytes needed starting at `*offset` (0 if none)
+ * @return ::JXL_DEC_SUCCESS on success, ::JXL_DEC_ERROR if TOC is unavailable,
+ *     arguments are NULL, or file offsets cannot be mapped.
+ */
+JXL_EXPORT JxlDecoderStatus JxlDecoderExperimentalGetNextRequiredOffset(
+    const JxlDecoder* dec, uint64_t* offset, uint64_t* length);
+
+/**
  * Supplies a sparse / discontinuous input buffer tagged with its original file
  * byte offset.
+ *
+ * Must be called after @ref JxlDecoderReleaseInput has released any active
+ * sequential input buffer (mixing @ref JxlDecoderSetInput with active sparse
+ * offset input within the same frame is disallowed and returns
+ * ::JXL_DEC_ERROR).
  *
  * Bytes intersecting still-needed TOC sections of the current frame are
  * retained (supporting arbitrary order, partial chunks, overlaps, and
@@ -260,7 +293,9 @@ JXL_EXPORT JxlDecoderStatus JxlDecoderExperimentalGetRequiredInputRanges(
  *
  * After supplying one or more ranges, call @ref JxlDecoderProcessInput to
  * advance decoding. Missing holes outside the required ranges will not block
- * frame completion.
+ * frame completion. Calling @ref JxlDecoderCloseInput while required sparse
+ * sections remain incomplete causes @ref JxlDecoderProcessInput to return
+ * ::JXL_DEC_ERROR.
  *
  * @param dec decoder object
  * @param data pointer to compressed bytes starting at `offset` in the file
