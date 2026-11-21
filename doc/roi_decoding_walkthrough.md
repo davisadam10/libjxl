@@ -38,13 +38,13 @@ Implemented all four approved phases aligned with upstream `libjxl` maintainer d
 | Suite | Command | Result |
 |---|---|---|
 | New ROI, Range Planning, Sparse I/O & Streaming Suite | `./build/lib/tests/decode_region_test` | **11 / 11 PASSED** (7.59 s, 0 pixel diffs) |
-| On-Demand 8K ACES RGB HALF Sparse Benchmark | `./build/lib/tests/decode_region_test --gtest_also_run_disabled_tests --gtest_filter=*Aces8k*` | **1 / 1 PASSED** (2.32 s, 0 pixel diffs) |
+| On-Demand 8K RGB HALF Sparse Benchmark | `./build/lib/tests/decode_region_test --gtest_also_run_disabled_tests --gtest_filter=*Float8k*` | **1 / 1 PASSED** (2.32 s, 0 pixel diffs) |
 | Existing Render Pipeline Regression Suite | `./build/lib/tests/render_pipeline_test` | **1,198 / 1,198 PASSED** (37.9 s) |
 | Existing Decoder Regression Suite | `./build/lib/tests/decode_test` | **2,895 / 2,895 PASSED** (30.6 s) |
 
 ### Key Coverage Verified in [decode_region_test.cc](../lib/jxl/decode_region_test.cc)
 - **`SparseRandomAccessAndRangePlanning`**: Bare codestream, `jxlc` container, reversed/sub-chunked/overlapping sparse delivery, and center-first permuted TOC (`group_order = 1`) — all 0-diff bit-exact with `> 48 / 64` groups skipped and `< 50%` bytes read.
-- **`Aces2kRgbHalfSparseRandomAccess`**: Fast 2K (2048×1080) ACEScg linear RGB HALF (`JXL_TYPE_FLOAT16`) lossless Modular sparse random-access (bare + container); aligned 256×256 crop decodes **1 / 40 groups** with 0-diff bitwise FP16 equality.
+- **`Float2kRgbHalfSparseRandomAccess`**: Fast 2K (2048×1080) linear RGB HALF (`JXL_TYPE_FLOAT16`) lossless Modular sparse random-access (bare + container); aligned 256×256 crop decodes **1 / 40 groups** with 0-diff bitwise FP16 equality.
 - **`All65536HalfPatternsBitExact`** (#3881): All 65,536 IEEE-754 HALF bit patterns (all finite normals, all subnormals, `-0.0`, and Inf/NaN) across 4 groups — 100% bitwise equal to full-frame `libjxl` decode.
 - **`VarDCTFeatureCombinations` & `LargeVarDCT2KRegions`**: Gaborish on/off, EPF 0/1/2/3, noise synthesis, resampling 2×/4×, progressive multi-pass, permuted TOC, unaligned 4-group crossings, 1×1 pixel, and full-image crops.
 - **`ModularGroupIndependentAndSqueezeFallback`**: Verified group-skipping lossless Modular (`JXL_EXP_FALLBACK_NONE`) and global Squeeze fallback (`JXL_EXP_FALLBACK_MODULAR_GLOBAL_TRANSFORMS`) under both sequential streaming and 2-round sparse input.
