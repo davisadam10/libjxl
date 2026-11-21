@@ -2,7 +2,7 @@
 
 ## Goal Description
 
-Extend our experimental decoder interface ([decode_roi_experimental.h](file:///home/antigravity/davisadam10/libjxl/lib/include/jxl/decode_roi_experimental.h), keeping [decode.h](file:///home/antigravity/davisadam10/libjxl/lib/include/jxl/decode.h) 100% untouched) to support **power-of-two reduced-resolution decoding** (`factor ∈ {1, 2, 4, 8}` — e.g., decoding an 8K 7680×4320 image directly at 4K, 2K 1920×1080, or 1K 960×540), composable with our existing **ROI selection**, **TOC byte-range planning**, **sparse offset-tagged input**, and **sequential push streaming**.
+Extend our experimental decoder interface ([decode_roi_experimental.h](../lib/include/jxl/decode_roi_experimental.h), keeping [decode.h](../lib/include/jxl/decode.h) 100% untouched) to support **power-of-two reduced-resolution decoding** (`factor ∈ {1, 2, 4, 8}` — e.g., decoding an 8K 7680×4320 image directly at 4K, 2K 1920×1080, or 1K 960×540), composable with our existing **ROI selection**, **TOC byte-range planning**, **sparse offset-tagged input**, and **sequential push streaming**.
 
 This design directly incorporates upstream maintainer discussions and constraints:
 - **#668 (deymo)**: Fixed power-of-two scale-down (`1, 2, 4, 8`) belongs in the low-level decoder so it can skip unneeded entropy passes, transforms, and output memory; arbitrary non-power-of-two scaling is out of scope.
@@ -75,9 +75,9 @@ flowchart TD
 
 ---
 
-## Experimental C API Additions ([decode_roi_experimental.h](file:///home/antigravity/davisadam10/libjxl/lib/include/jxl/decode_roi_experimental.h))
+## Experimental C API Additions ([decode_roi_experimental.h](../lib/include/jxl/decode_roi_experimental.h))
 
-Keeping [decode.h](file:///home/antigravity/davisadam10/libjxl/lib/include/jxl/decode.h) **100% untouched**:
+Keeping [decode.h](../lib/include/jxl/decode.h) **100% untouched**:
 
 ```c
 /**
@@ -145,27 +145,27 @@ And extend `JxlExperimentalRegionDecodeStats` with:
 ## Proposed Changes
 
 ### 1. Experimental Header
-#### [MODIFY] [decode_roi_experimental.h](file:///home/antigravity/davisadam10/libjxl/lib/include/jxl/decode_roi_experimental.h)
+#### [MODIFY] [decode_roi_experimental.h](../lib/include/jxl/decode_roi_experimental.h)
 - Add `JxlExperimentalScalePolicy`, `JxlExperimentalScaleDecodeMode`, extended `JxlExperimentalRegionDecodeStats` fields, `JxlDecoderExperimentalSetOutputDownsampling`, and `JxlDecoderExperimentalGetScaledOutputInfo`.
 
 ### 2. Streaming Float Box Downsampling Output Stage
-#### [MODIFY] [stage_write.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/stage_write.h) & [stage_write.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/stage_write.cc)
+#### [MODIFY] [stage_write.h](../lib/jxl/render_pipeline/stage_write.h) & [stage_write.cc](../lib/jxl/render_pipeline/stage_write.cc)
 - Add `size_t downsampling = 1` support and `FinalizeOutput()` hook on `WriteToOutputStage` / `RenderPipeline`.
 - Accumulate unoriented rows in unclamped 32-bit float space into a compact `scaled_region_w × scaled_region_h` buffer with row-striped locking; divide by exact `tile_w * tile_h` in `FinalizeOutput()`, then apply orientation, unpremul alpha, `kDither`/format conversion, and buffer/callback output.
 
 ### 3. Native Fast Paths (VarDCT 1:8 DC, Modular Squeeze, Progressive Pass Skip)
-#### [MODIFY] [dec_modular.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_modular.h) & [dec_modular.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_modular.cc)
+#### [MODIFY] [dec_modular.h](../lib/jxl/dec_modular.h) & [dec_modular.cc](../lib/jxl/dec_modular.cc)
 - Add `CanDecodeAtDownsampling(size_t downsampling) const` and partial `kSqueeze` inverse in `FinalizeDecoding(...)` stopping at `target_shift = CeilLog2Nonzero(downsampling)`, outputting native reduced-resolution planes.
 
-#### [MODIFY] [dec_cache.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_cache.h) & [dec_cache.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_cache.cc)
+#### [MODIFY] [dec_cache.h](../lib/jxl/dec_cache.h) & [dec_cache.cc](../lib/jxl/dec_cache.cc)
 - Add `size_t output_downsampling = 1` and `bool native_dc_8x = false` to `PassesDecoderState`; disable `fast_xyb_srgb8_conversion` when `output_downsampling > 1`; support lightweight 1:8 DC color+output pipeline when `native_dc_8x` is active.
 
-#### [MODIFY] [dec_frame.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_frame.h) & [dec_frame.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_frame.cc)
+#### [MODIFY] [dec_frame.h](../lib/jxl/dec_frame.h) & [dec_frame.cc](../lib/jxl/dec_frame.cc)
 - Add `ScalePolicy`, `ScaleDecodeMode`, `SetOutputDownsampling(size_t factor, ScalePolicy policy)`, and `IsFastNativeScaleAvailable() const`.
 - Update `PlanRequiredGroups`, `IsSectionRequiredPlanned`, `GetRequiredCodestreamRanges`, `ProcessSections`, and `FinalizeFrame` to select Paths A/B/C/D according to `policy` (returning error under `kRequireFastNative` when no native path exists), skip AC Global + AC groups for Path A, skip unneeded passes for Paths B & C, and run `FinalizeOutput()` / native DC render in `FinalizeFrame()`.
 
 ### 4. Decoder State Machine & Introspection
-#### [MODIFY] [decode.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/decode.cc)
+#### [MODIFY] [decode.cc](../lib/jxl/decode.cc)
 - Add `output_downsampling` (default `1`) and `scale_policy` to `JxlDecoder` (reset in `JxlDecoderReset`, preserved across `JxlDecoderRewind`).
 - Implement `JxlDecoderExperimentalSetOutputDownsampling` and `JxlDecoderExperimentalGetScaledOutputInfo`.
 - Update `ValidateDecodeRegionBounds`, `GetMinSize`, and `PopulateRegionStats` to respect effective scaled dimensions and report `downsampling`, `scale_policy`, `scale_mode`, `total_passes`, and `required_passes`.
@@ -174,7 +174,7 @@ And extend `JxlExperimentalRegionDecodeStats` with:
 
 ## Verification Plan
 
-### New Test Suite ([decode_scale_test.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/decode_scale_test.cc), registered in [jxl_lists.cmake](file:///home/antigravity/davisadam10/libjxl/lib/jxl_lists.cmake))
+### New Test Suite ([decode_scale_test.cc](../lib/jxl/decode_scale_test.cc), registered in [jxl_lists.cmake](../lib/jxl_lists.cmake))
 
 1. **Adversarial Non-Squeeze Lossless Modular FP16 & HDR Float Fidelity**:
    - Test linear HDR images containing negative values (`-0.25`), subnormals, `-0.0`, and highlights (`> 1.0`, up to `8.0`) in both `JXL_TYPE_FLOAT` and `JXL_TYPE_FLOAT16`.
