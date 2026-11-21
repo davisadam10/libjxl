@@ -1195,13 +1195,61 @@ Status FrameDecoder::Flush() {
   }
   JXL_RETURN_IF_ERROR(AllocateOutput());
 
+  if (scale_mode_ == ScaleDecodeMode::kNativeVarDCTDC) {
+    const size_t dc_w = DivCeil(frame_dim_.xsize_upsampled, 8);
+    const size_t dc_h = DivCeil(frame_dim_.ysize_upsampled, 8);
+    FrameDimensions scaled_dim;
+    scaled_dim.Set(dc_w, dc_h, frame_header_.group_size_shift, 0, 0, false, 1);
+    const Image3F& dc = *dec_state_->shared->dc;
+    JXL_ENSURE(dc.xsize() >= dc_w && dc.ysize() >= dc_h);
+    for (size_t g = 0; g < scaled_dim.num_groups; ++g) {
+      dec_state_->render_pipeline->ClearDone(g);
+    }
+    const auto init = [&](size_t num_threads) -> Status {
+      return dec_state_->render_pipeline->PrepareForThreads(
+          num_threads, /*use_group_ids=*/false);
+    };
+    const auto process_group = [&](const uint32_t g,
+                                   size_t thread_id) -> Status {
+      RenderPipelineInput input =
+          dec_state_->render_pipeline->GetInputBuffers(g, thread_id);
+      const Rect gr = scaled_dim.GroupRect(g);
+      for (size_t c = 0; c < 3; ++c) {
+        const auto& buf = input.GetBuffer(c);
+        const Rect& r = buf.second;
+        JXL_ENSURE(r.xsize() == gr.xsize() && r.ysize() == gr.ysize());
+        for (size_t y = 0; y < r.ysize(); ++y) {
+          memcpy(r.Row(buf.first, y),
+                 dc.ConstPlaneRow(c, gr.y0() + y) + gr.x0(),
+                 r.xsize() * sizeof(float));
+        }
+      }
+      return input.Done();
+    };
+    JXL_RETURN_IF_ERROR(RunOnPool(pool_, 0, scaled_dim.num_groups, init,
+                                  process_group, "VarDCTDCFlush"));
+    return true;
+  }
+
+  if (scale_mode_ == ScaleDecodeMode::kModularSqueezeNative) {
+    JXL_RETURN_IF_ERROR(modular_frame_decoder_.FinalizeDecoding(
+        frame_header_, dec_state_, pool_, /*inplace=*/false,
+        /*downsampling=*/output_downsampling_));
+    return true;
+  }
+
+  const bool streaming_downsample = (output_downsampling_ > 1);
   uint32_t completely_decoded_ac_pass = NumCompletePasses();
-  if (completely_decoded_ac_pass < frame_header_.passes.num_passes) {
+  if (completely_decoded_ac_pass < required_passes_) {
+    if (streaming_downsample && dec_state_->render_pipeline) {
+      dec_state_->render_pipeline->ResetOutputAccumulator();
+    }
     // We don't have all AC yet: force a draw of all the missing areas.
     // Mark all sections as not complete.
     for (size_t i = 0; i < decoded_passes_per_ac_group_.size(); i++) {
       if (can_skip_ac_groups_ && !required_ac_groups_[i]) continue;
-      if (decoded_passes_per_ac_group_[i] < frame_header_.passes.num_passes) {
+      if (streaming_downsample ||
+          decoded_passes_per_ac_group_[i] < required_passes_) {
         dec_state_->render_pipeline->ClearDone(i);
       }
     }
@@ -1210,12 +1258,13 @@ Status FrameDecoder::Flush() {
           PrepareStorage(num_threads, decoded_passes_per_ac_group_.size()));
       return true;
     };
-    const auto process_group = [this](const uint32_t g,
-                                      size_t thread) -> Status {
+    const auto process_group = [this, streaming_downsample](
+                                   const uint32_t g, size_t thread) -> Status {
       if (can_skip_ac_groups_ && !required_ac_groups_[g]) {
         return true;
       }
-      if (decoded_passes_per_ac_group_[g] == frame_header_.passes.num_passes) {
+      if (!streaming_downsample &&
+          decoded_passes_per_ac_group_[g] >= required_passes_) {
         // This group was drawn already, nothing to do.
         return true;
       }
@@ -1233,6 +1282,19 @@ Status FrameDecoder::Flush() {
   // undo global modular transforms and copy int pixel buffers to float ones
   JXL_RETURN_IF_ERROR(modular_frame_decoder_.FinalizeDecoding(
       frame_header_, dec_state_, pool_, is_finalized_));
+
+  if (streaming_downsample && dec_state_->render_pipeline) {
+    JXL_RETURN_IF_ERROR(
+        dec_state_->render_pipeline->FinalizeOutput(/*final_pass=*/false));
+    if (!is_finalized_) {
+      dec_state_->render_pipeline->ResetOutputAccumulator();
+      for (size_t i = 0; i < decoded_passes_per_ac_group_.size(); ++i) {
+        if (decoded_passes_per_ac_group_[i] < required_passes_) {
+          dec_state_->render_pipeline->ClearDone(i);
+        }
+      }
+    }
+  }
 
   return true;
 }

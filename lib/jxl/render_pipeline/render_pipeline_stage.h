@@ -200,7 +200,13 @@ class RenderPipelineStage {
 
   // Optional finalization hook called once all frame groups have been
   // processed (used e.g. to flush streaming downsampling accumulators).
-  virtual Status FinalizeOutput() { return true; }
+  // When `final_pass` is false (e.g. during progressive Flush), stages must
+  // keep their internal state valid for subsequent passes.
+  virtual Status FinalizeOutput(bool final_pass = true) { return true; }
+
+  // Resets any per-frame output accumulation buffers (used before a full
+  // progressive Flush redraw).
+  virtual void ResetOutputAccumulator() {}
 
   virtual const char* GetName() const = 0;
 

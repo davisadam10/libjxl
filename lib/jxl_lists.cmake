@@ -512,6 +512,7 @@ set(JPEGXL_INTERNAL_TESTS
   jxl/dct_test.cc
   jxl/decode_region_test.cc
   jxl/decode_scale_test.cc
+  jxl/decode_streaming_test.cc
   jxl/decode_test.cc
   jxl/enc_bit_writer_test.cc
   jxl/enc_external_image_test.cc

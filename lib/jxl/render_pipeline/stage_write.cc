@@ -439,7 +439,16 @@ class WriteToOutputStage : public RenderPipelineStage {
     return true;
   }
 
-  Status FinalizeOutput() override {
+  void ResetOutputAccumulator() override {
+    if (!accum_main_.empty()) {
+      std::fill(accum_main_.begin(), accum_main_.end(), 0.0f);
+    }
+    for (auto& ec_buf : accum_extra_) {
+      std::fill(ec_buf.begin(), ec_buf.end(), 0.0f);
+    }
+  }
+
+  Status FinalizeOutput(bool final_pass) override {
     if (downsampling_ <= 1 || accum_main_.empty()) {
       return true;
     }
@@ -492,8 +501,10 @@ class WriteToOutputStage : public RenderPipelineStage {
         }
       }
     }
-    accum_main_.clear();
-    accum_extra_.clear();
+    if (final_pass) {
+      accum_main_.clear();
+      accum_extra_.clear();
+    }
     return true;
   }
 
