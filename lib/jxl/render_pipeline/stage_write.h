@@ -12,6 +12,8 @@
 #include <memory>
 #include <vector>
 
+#include "lib/jxl/base/rect.h"
+#include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/dec_cache.h"
 #include "lib/jxl/dec_xyb.h"
 #include "lib/jxl/image.h"
@@ -32,7 +34,8 @@ std::unique_ptr<RenderPipelineStage> GetWriteToImage3FStage(
 std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
     const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
     bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
-    std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager);
+    std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager,
+    const Rect& output_region = Rect(), const Rect& unoriented_region = Rect());
 
 }  // namespace jxl
 

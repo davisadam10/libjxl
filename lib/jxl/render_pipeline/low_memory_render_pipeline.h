@@ -29,6 +29,13 @@ class LowMemoryRenderPipeline final : public RenderPipeline {
   explicit LowMemoryRenderPipeline(JxlMemoryManager* memory_manager)
       : RenderPipeline(memory_manager) {}
 
+  std::pair<size_t, size_t> GroupBorder() const override {
+    return group_border_;
+  }
+  size_t BaseColorShift() const override { return base_color_shift_; }
+  void SetRenderRegion(const Rect& unoriented_image_region) override;
+  Status RenderOutOfFramePadding(size_t thread_id) override;
+
  private:
   std::vector<std::pair<ImageF*, Rect>> PrepareBuffers(
       size_t group_id, size_t thread_id) override;
@@ -57,7 +64,7 @@ class LowMemoryRenderPipeline final : public RenderPipeline {
 
   std::pair<size_t, size_t> BorderToStore(size_t c) const;
 
-  bool use_group_ids_;
+  bool use_group_ids_ = false;
 
   // Storage for borders between groups. Borders of adjacent groups are stacked
   // together, e.g. bottom border of current group is followed by top border
@@ -113,10 +120,16 @@ class LowMemoryRenderPipeline final : public RenderPipeline {
   size_t first_trailing_stage_;
 
   // Origin and size of the frame after switching to image dimensions.
-  FrameOrigin frame_origin_;
-  size_t full_image_xsize_;
-  size_t full_image_ysize_;
-  size_t first_image_dim_stage_;
+  FrameOrigin frame_origin_ = {0, 0};
+  size_t full_image_xsize_ = 0;
+  size_t full_image_ysize_ = 0;
+  size_t first_image_dim_stage_ = 0;
+
+  // Optional render region (unoriented full-image coords and frame color-channel
+  // coords) for region-specific decoding.
+  bool has_render_region_ = false;
+  Rect render_image_rect_;
+  Rect render_color_rect_;
 };
 
 }  // namespace jxl

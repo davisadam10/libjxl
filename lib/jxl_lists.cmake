@@ -543,6 +543,7 @@ set(JPEGXL_INTERNAL_PUBLIC_HEADERS
   include/jxl/compressed_icc.h
   include/jxl/decode.h
   include/jxl/decode_cxx.h
+  include/jxl/decode_roi_experimental.h
   include/jxl/encode.h
   include/jxl/encode_cxx.h
   include/jxl/gain_map.h
@@ -592,6 +593,7 @@ set(JPEGXL_INTERNAL_TESTS
   jxl/convolve_test.cc
   jxl/data_parallel_test.cc
   jxl/dct_test.cc
+  jxl/decode_region_test.cc
   jxl/decode_test.cc
   jxl/enc_external_image_test.cc
   jxl/enc_gaborish_test.cc
