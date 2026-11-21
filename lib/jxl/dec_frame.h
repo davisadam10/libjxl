@@ -122,14 +122,94 @@ class FrameDecoder {
 
   const FrameHeader& GetFrameHeader() const { return frame_header_; }
 
+  struct ByteRange {
+    uint64_t offset;
+    uint64_t length;
+  };
+
+  enum class RegionFallbackReason {
+    kNone = 0,
+    kNoRegion = 1,
+    kSingleSection = 2,
+    kReferenceableFrame = 3,
+    kModularGlobalTransforms = 4,
+    kSimpleRenderPipeline = 5,
+    kJpegReconstruction = 6,
+  };
+
+  struct RegionDecodeStats {
+    RegionFallbackReason fallback_reason = RegionFallbackReason::kNoRegion;
+    size_t total_groups = 0;
+    size_t required_groups = 0;
+    size_t skipped_groups = 0;
+    size_t total_sections = 0;
+    size_t required_sections = 0;
+    uint64_t total_frame_payload_bytes = 0;
+  };
+
   // Returns whether a DC image has been decoded, accessible at low resolution
   // at passes.shared_storage.dc_storage
   bool HasDecodedDC() const { return finalized_dc_; }
-  bool HasDecodedAll() const { return toc_.size() == num_sections_done_; }
+  bool HasDecodedAll() const {
+    if (toc_.size() == 1) return num_sections_done_ == 1;
+    return finalized_dc_ && num_sections_done_ == num_required_sections_;
+  }
+
+  void SetDecodeRegion(const Rect& output_region, size_t oriented_xsize = 0,
+                       size_t oriented_ysize = 0,
+                       Orientation undo_orientation = Orientation::kIdentity) {
+    output_region_ = output_region;
+    if (oriented_xsize > 0 && oriented_ysize > 0) {
+      region_oriented_xsize_ = oriented_xsize;
+      region_oriented_ysize_ = oriented_ysize;
+      region_undo_orientation_ = undo_orientation;
+    }
+    PlanRequiredGroups(/*after_dc_global=*/finalized_dc_);
+  }
+
+  // Returns true if section `section_id` is required under the current plan
+  // (works even before finalized_dc_ for TOC range planning / sparse input).
+  bool IsSectionRequiredPlanned(size_t section_id) const {
+    if (!can_skip_ac_groups_) return true;
+    const size_t ac_global_index = frame_dim_.num_dc_groups + 1;
+    if (section_id <= ac_global_index) return true;
+    const size_t ac_idx = section_id - ac_global_index - 1;
+    const size_t acg = ac_idx % frame_dim_.num_groups;
+    return acg < required_ac_groups_.size() && required_ac_groups_[acg] != 0;
+  }
+
+  // Conservative check for sequential streaming: never drops sections before
+  // finalized_dc_ confirms Modular UsesFullImage().
+  bool IsSectionRequired(size_t section_id) const {
+    if (!finalized_dc_) return true;
+    return IsSectionRequiredPlanned(section_id);
+  }
+
+  const std::vector<uint64_t>& SectionCodestreamOffsets() const {
+    return section_codestream_offsets_;
+  }
+
+  // Returns sorted, optionally coalesced codestream-relative byte ranges (from
+  // start of frame payload after TOC) for all still-unprocessed required
+  // sections.
+  void GetRequiredCodestreamRanges(bool coalesce_adjacent,
+                                   std::vector<ByteRange>* ranges) const;
+
+  RegionDecodeStats GetRegionDecodeStats() const;
 
   size_t NumCompletePasses() const {
-    return *std::min_element(decoded_passes_per_ac_group_.begin(),
-                             decoded_passes_per_ac_group_.end());
+    if (!can_skip_ac_groups_) {
+      return *std::min_element(decoded_passes_per_ac_group_.begin(),
+                               decoded_passes_per_ac_group_.end());
+    }
+    size_t min_passes = frame_header_.passes.num_passes;
+    for (size_t g = 0; g < decoded_passes_per_ac_group_.size(); ++g) {
+      if (required_ac_groups_[g]) {
+        min_passes =
+            std::min<size_t>(min_passes, decoded_passes_per_ac_group_[g]);
+      }
+    }
+    return min_passes;
   }
 
   // If enabled, ProcessSections will stop and return true when the DC
@@ -195,12 +275,17 @@ class FrameDecoder {
                       bool unpremul_alpha, bool undo_orientation) const {
     dec_state_->width = xsize;
     dec_state_->height = ysize;
+    dec_state_->output_region = output_region_;
     dec_state_->main_output.format = format;
     dec_state_->main_output.bits_per_sample = bits_per_sample;
     dec_state_->main_output.callback = pixel_callback;
     dec_state_->main_output.buffer = image_buffer;
     dec_state_->main_output.buffer_size = image_buffer_size;
-    dec_state_->main_output.stride = GetStride(xsize, format);
+    const size_t stride_xsize =
+        (output_region_.xsize() > 0 && output_region_.ysize() > 0)
+            ? output_region_.xsize()
+            : xsize;
+    dec_state_->main_output.stride = GetStride(stride_xsize, format);
     const jxl::ExtraChannelInfo* alpha =
         decoded_->metadata()->Find(jxl::ExtraChannel::kAlpha);
     if (alpha && alpha->alpha_associated && unpremul_alpha) {
@@ -236,11 +321,19 @@ class FrameDecoder {
     out.bits_per_sample = bits_per_sample;
     out.buffer = buffer;
     out.buffer_size = buffer_size;
-    out.stride = GetStride(xsize, format);
+    const size_t stride_xsize =
+        (output_region_.xsize() > 0 && output_region_.ysize() > 0)
+            ? output_region_.xsize()
+            : xsize;
+    out.stride = GetStride(stride_xsize, format);
     dec_state_->extra_output.push_back(out);
   }
 
  private:
+  using PassesReaders = std::array<BitReader*, kMaxNumPasses>;
+
+  std::pair<size_t, size_t> EstimateGroupBorderFromHeader() const;
+  void PlanRequiredGroups(bool after_dc_global);
   Status ProcessDCGlobal(BitReader* br);
   Status ProcessDCGroup(size_t dc_group_id, BitReader* br);
   Status FinalizeDC();
@@ -335,6 +428,18 @@ class FrameDecoder {
   // Number of completed passes where section decoding should pause.
   // Used for progressive details at least kLastPasses.
   std::vector<int> passes_to_pause_;
+
+  // Optional decode region in oriented output coordinates.
+  std::vector<uint64_t> section_codestream_offsets_;
+  Rect output_region_;
+  size_t region_oriented_xsize_ = 0;
+  size_t region_oriented_ysize_ = 0;
+  Orientation region_undo_orientation_ = Orientation::kIdentity;
+  bool can_skip_ac_groups_ = false;
+  std::vector<uint8_t> required_ac_groups_;
+  size_t num_required_groups_ = 0;
+  size_t num_required_sections_ = 0;
+  RegionFallbackReason fallback_reason_ = RegionFallbackReason::kNoRegion;
 };
 
 }  // namespace jxl

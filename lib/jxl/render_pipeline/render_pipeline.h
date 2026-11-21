@@ -116,6 +116,11 @@ class RenderPipeline {
 
   virtual void ClearDone(size_t i) {}
 
+  virtual std::pair<size_t, size_t> GroupBorder() const { return {0, 0}; }
+  virtual size_t BaseColorShift() const { return 0; }
+  virtual void SetRenderRegion(const Rect& unoriented_image_region) {}
+  virtual Status RenderOutOfFramePadding(size_t thread_id) { return true; }
+
  protected:
   explicit RenderPipeline(JxlMemoryManager* memory_manager)
       : memory_manager_(memory_manager) {}
