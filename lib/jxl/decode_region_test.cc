@@ -237,7 +237,7 @@ std::vector<uint8_t> EncodeJxl(const std::vector<uint8_t>& pixels, size_t width,
 
 // Encodes an RGB HALF (FP16) lossless Modular JXL (ACES2065-1 linear primaries
 // / custom primaries + linear transfer function).
-std::vector<uint8_t> EncodeAcesRgbHalfJxl(const std::vector<uint16_t>& pixels,
+std::vector<uint8_t> EncodeRgbFloat16Jxl(const std::vector<uint16_t>& pixels,
                                           size_t width, size_t height,
                                           int effort = 1,
                                           bool use_container = false,
@@ -712,14 +712,14 @@ TEST(DecodeRegionTest, SparseRandomAccessAndRangePlanning) {
   }
 }
 
-TEST(DecodeRegionTest, Aces2kRgbHalfSparseRandomAccess) {
+TEST(DecodeRegionTest, Float2kRgbHalfSparseRandomAccess) {
   const size_t w = 2048;
   const size_t h = 1080;
   auto src = GenerateRgbHalfImage(w, h, /*seed=*/2026);
   const JxlPixelFormat format = {3, JXL_TYPE_FLOAT16, JXL_NATIVE_ENDIAN, 0};
 
   for (bool use_container : {false, true}) {
-    auto jxl = EncodeAcesRgbHalfJxl(src, w, h, /*effort=*/1, use_container);
+    auto jxl = EncodeRgbFloat16Jxl(src, w, h, /*effort=*/1, use_container);
     auto full = DecodeJxl(jxl, format, false, 0, 0, 0, 0, 0, false, true);
 
     const uint32_t regions[][4] = {
@@ -735,7 +735,7 @@ TEST(DecodeRegionTest, Aces2kRgbHalfSparseRandomAccess) {
       ExpectBitExactRegion(
           full.pixels, full.width, sparse.pixels, format, r[0], r[1], r[2],
           r[3],
-          "ACES 2K HALF container=" + std::to_string(use_container) + " x0=" +
+          "Float 2K HALF container=" + std::to_string(use_container) + " x0=" +
               std::to_string(r[0]));
       EXPECT_EQ(JXL_EXP_FALLBACK_NONE, sparse.stats.fallback_reason);
       EXPECT_GT(sparse.stats.skipped_groups, 0u);
@@ -772,7 +772,7 @@ TEST(DecodeRegionTest, All65536HalfPatternsBitExact) {
     }
   }
 
-  auto jxl = EncodeAcesRgbHalfJxl(src, w, h, /*effort=*/1);
+  auto jxl = EncodeRgbFloat16Jxl(src, w, h, /*effort=*/1);
   const JxlPixelFormat format = {3, JXL_TYPE_FLOAT16, JXL_NATIVE_ENDIAN, 0};
   auto full = DecodeJxl(jxl, format, false, 0, 0, 0, 0);
 
@@ -822,15 +822,15 @@ TEST(DecodeRegionTest, All65536HalfPatternsBitExact) {
   EXPECT_EQ(inf_nan_checked, inf_nan_bitwise_equal);
 }
 
-// Full 8K (7680x4320) ACES2065-1 RGB HALF sparse random-access benchmark test.
+// Full 8K (7680x4320) linear RGB HALF sparse random-access benchmark test.
 // Kept DISABLED_ by default so standard unit test runs stay fast; run on demand:
 //   ./build/lib/tests/decode_region_test --gtest_also_run_disabled_tests
-//   --gtest_filter=*Aces8k*
-TEST(DecodeRegionTest, DISABLED_Aces8kRgbHalfSparseBenchmark) {
+//   --gtest_filter=*Float8k*
+TEST(DecodeRegionTest, DISABLED_Float8kRgbHalfSparseBenchmark) {
   const size_t w = 7680;
   const size_t h = 4320;
   auto src = GenerateRgbHalfImage(w, h, /*seed=*/8000);
-  auto jxl = EncodeAcesRgbHalfJxl(src, w, h, /*effort=*/1);
+  auto jxl = EncodeRgbFloat16Jxl(src, w, h, /*effort=*/1);
   const JxlPixelFormat format = {3, JXL_TYPE_FLOAT16, JXL_NATIVE_ENDIAN, 0};
 
   auto t0 = std::chrono::steady_clock::now();
@@ -841,7 +841,7 @@ TEST(DecodeRegionTest, DISABLED_Aces8kRgbHalfSparseBenchmark) {
   auto t2 = std::chrono::steady_clock::now();
 
   ExpectBitExactRegion(full.pixels, full.width, sparse.pixels, format, 3584,
-                       2048, 512, 512, "8K ACES RGB HALF 512x512");
+                       2048, 512, 512, "8K Float RGB HALF 512x512");
   EXPECT_EQ(JXL_EXP_FALLBACK_NONE, sparse.stats.fallback_reason);
   EXPECT_EQ(4u, sparse.stats.required_groups);
   EXPECT_LT(sparse.bytes_fed, jxl.size() / 20);  // < 5% of file!
@@ -851,7 +851,7 @@ TEST(DecodeRegionTest, DISABLED_Aces8kRgbHalfSparseBenchmark) {
   const double sparse_ms =
       std::chrono::duration<double, std::milli>(t2 - t1).count();
   printf(
-      "[8K ACES HALF 512x512] file=%zu bytes, sparse_read=%zu bytes (%.2f%%), "
+      "[8K Float HALF 512x512] file=%zu bytes, sparse_read=%zu bytes (%.2f%%), "
       "ranges=%zu, groups=%zu/%zu, full=%.1f ms, sparse=%.1f ms\n",
       jxl.size(), sparse.bytes_fed,
       100.0 * static_cast<double>(sparse.bytes_fed) /
