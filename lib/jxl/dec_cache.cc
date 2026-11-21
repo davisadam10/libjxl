@@ -239,6 +239,9 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
     }
   }
 
+  const Rect unoriented_region =
+      ComputeUnorientedRegion(output_region, width, height, undo_orientation);
+
   if (fast_xyb_srgb8_conversion) {
 #if !JXL_HIGH_PRECISION
     JXL_ENSURE(!NeedsBlending(frame_header));
@@ -248,9 +251,9 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
                !metadata->Find(ExtraChannel::kSpotColor));
     bool is_rgba = (main_output.format.num_channels == 4);
     uint8_t* rgb_output = reinterpret_cast<uint8_t*>(main_output.buffer);
-    JXL_RETURN_IF_ERROR(builder.AddStage(
-        GetFastXYBTosRGB8Stage(rgb_output, main_output.stride, width, height,
-                               is_rgba, has_alpha, alpha_c)));
+    JXL_RETURN_IF_ERROR(builder.AddStage(GetFastXYBTosRGB8Stage(
+        rgb_output, main_output.stride, width, height, is_rgba, has_alpha,
+        alpha_c, output_region)));
 #endif
   } else {
     bool linear = false;
@@ -359,7 +362,8 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
     if (main_output.callback.IsPresent() || main_output.buffer) {
       JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToOutputStage(
           main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
-          undo_orientation, extra_output, memory_manager)));
+          undo_orientation, extra_output, memory_manager, output_region,
+          unoriented_region)));
     } else {
       JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToImageBundleStage(
           decoded, &output_encoding_info.color_encoding)));
@@ -367,6 +371,10 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
   }
   JXL_ASSIGN_OR_RETURN(render_pipeline,
                        std::move(builder).Finalize(shared->frame_dim));
+  if (unoriented_region.xsize() > 0 && unoriented_region.ysize() > 0 &&
+      !frame_header.CanBeReferenced() && frame_header.dc_level == 0) {
+    render_pipeline->SetRenderRegion(unoriented_region);
+  }
   return render_pipeline->IsInitialized();
 }
 

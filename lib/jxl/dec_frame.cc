@@ -176,8 +176,10 @@ Status FrameDecoder::InitFrame(BitReader* JXL_RESTRICT br, ImageBundle* decoded,
       ReadToc(memory_manager, toc_entries, br, &sizes, &permutation));
   bool have_permutation = !permutation.empty();
   toc_.resize(toc_entries);
+  section_codestream_offsets_.resize(toc_entries);
   section_sizes_sum_ = 0;
   for (size_t i = 0; i < toc_entries; ++i) {
+    section_codestream_offsets_[i] = section_sizes_sum_;
     toc_[i].size = sizes[i];
     size_t index = have_permutation ? permutation[i] : i;
     toc_[index].id = i;
@@ -263,6 +265,11 @@ Status FrameDecoder::InitFrameOutput() {
   processed_section_.clear();
   processed_section_.resize(toc_.size());
   allocated_ = false;
+  can_skip_ac_groups_ = false;
+  required_ac_groups_.assign(frame_dim_.num_groups, 1);
+  num_required_groups_ = frame_dim_.num_groups;
+  num_required_sections_ = toc_.size();
+  fallback_reason_ = RegionFallbackReason::kNoRegion;
   return true;
 }
 
@@ -668,6 +675,7 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
         pipeline_options));
     JXL_RETURN_IF_ERROR(FinalizeDC());
     JXL_RETURN_IF_ERROR(AllocateOutput());
+    PlanRequiredGroups(/*after_dc_global=*/true);
     if (progressive_detail_ >= JxlProgressiveDetail::kDC) {
       MarkSections(sections, num, section_status);
       return true;
@@ -677,6 +685,14 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
   if (finalized_dc_ && ac_global_sec != num && !decoded_ac_global_) {
     JXL_RETURN_IF_ERROR(ProcessACGlobal(sections[ac_global_sec].br));
     section_status[ac_global_sec] = SectionStatus::kDone;
+  }
+
+  if (can_skip_ac_groups_) {
+    for (size_t i = 0; i < ac_group_sec.size(); i++) {
+      if (!required_ac_groups_[i]) {
+        desired_num_ac_passes[i] = 0;
+      }
+    }
   }
 
   if (progressive_detail_ >= JxlProgressiveDetail::kLastPasses) {
@@ -732,6 +748,238 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
   return true;
 }
 
+std::pair<size_t, size_t> FrameDecoder::EstimateGroupBorderFromHeader() const {
+  const size_t base_shift = CeilLog2Nonzero(frame_header_.upsampling);
+  size_t pad_x = 0;
+  size_t pad_y = 0;
+  if (frame_header_.upsampling != 1) {
+    pad_x = 2;
+    pad_y = 2;
+  }
+  const LoopFilter& lf = frame_header_.loop_filter;
+  if (lf.epf_iters >= 2) {
+    pad_x += 1;
+    pad_y += 1;
+  }
+  if (lf.epf_iters >= 1) {
+    pad_x += 2;
+    pad_y += 2;
+  }
+  if (lf.epf_iters >= 3) {
+    pad_x += 3;
+    pad_y += 3;
+  }
+  if (lf.gab) {
+    pad_x += 1;
+    pad_y += 1;
+  }
+  if (!frame_header_.chroma_subsampling.Is444()) {
+    const size_t max_hs = frame_header_.chroma_subsampling.MaxHShift();
+    const size_t max_vs = frame_header_.chroma_subsampling.MaxVShift();
+    if (max_hs > 0) {
+      size_t cx = pad_x;
+      for (size_t s = 0; s < max_hs; ++s) {
+        cx = DivCeil(cx, size_t{2}) + 1;
+      }
+      pad_x = RoundUpTo(std::max(pad_x, cx << max_hs), size_t{1} << max_hs);
+    }
+    if (max_vs > 0) {
+      size_t cy = pad_y;
+      for (size_t s = 0; s < max_vs; ++s) {
+        cy = DivCeil(cy, size_t{2}) + 1;
+      }
+      pad_y = RoundUpTo(std::max(pad_y, cy << max_vs), size_t{1} << max_vs);
+    }
+  }
+  if ((frame_header_.flags & FrameHeader::kNoise) != 0) {
+    const size_t noise_pad = DivCeil(size_t{2}, size_t{1} << base_shift);
+    pad_x = std::max(pad_x, noise_pad);
+    pad_y = std::max(pad_y, noise_pad);
+  }
+  for (size_t ec_ups : frame_header_.extra_channel_upsampling) {
+    if (ec_ups != 1) {
+      const size_t ec_shift = CeilLog2Nonzero(ec_ups);
+      const size_t ec_pad =
+          DivCeil(size_t{2} << ec_shift, size_t{1} << base_shift);
+      pad_x = std::max(pad_x, ec_pad);
+      pad_y = std::max(pad_y, ec_pad);
+    }
+  }
+  if (pad_x > 0) {
+    // Match LowMemoryRenderPipeline::kGroupXAlign (16 on x86, 4 on ARM).
+    pad_x = RoundUpTo(pad_x, size_t{16});
+  }
+  return {pad_x, pad_y};
+}
+
+void FrameDecoder::PlanRequiredGroups(bool after_dc_global) {
+  can_skip_ac_groups_ = false;
+  required_ac_groups_.assign(frame_dim_.num_groups, 1);
+  num_required_groups_ = frame_dim_.num_groups;
+  num_required_sections_ = toc_.size();
+
+  if (output_region_.xsize() == 0 || output_region_.ysize() == 0) {
+    fallback_reason_ = RegionFallbackReason::kNoRegion;
+    return;
+  }
+  if (toc_.size() <= 1) {
+    fallback_reason_ = RegionFallbackReason::kSingleSection;
+    return;
+  }
+  if (frame_header_.CanBeReferenced() || frame_header_.dc_level != 0) {
+    fallback_reason_ = RegionFallbackReason::kReferenceableFrame;
+    return;
+  }
+  if (use_slow_rendering_pipeline_) {
+    fallback_reason_ = RegionFallbackReason::kSimpleRenderPipeline;
+    return;
+  }
+  if (decoded_ && decoded_->IsJPEG()) {
+    fallback_reason_ = RegionFallbackReason::kJpegReconstruction;
+    return;
+  }
+  if (after_dc_global && modular_frame_decoder_.UsesFullImage()) {
+    fallback_reason_ = RegionFallbackReason::kModularGlobalTransforms;
+    return;
+  }
+
+  size_t unoriented_w = 0;
+  size_t unoriented_h = 0;
+  Orientation undo_orientation = Orientation::kIdentity;
+  if (after_dc_global && dec_state_->width > 0 && dec_state_->height > 0) {
+    unoriented_w = dec_state_->width;
+    unoriented_h = dec_state_->height;
+    undo_orientation = dec_state_->undo_orientation;
+  } else if (region_oriented_xsize_ > 0 && region_oriented_ysize_ > 0) {
+    unoriented_w = region_oriented_xsize_;
+    unoriented_h = region_oriented_ysize_;
+    undo_orientation = region_undo_orientation_;
+    if (static_cast<int>(undo_orientation) > 4) {
+      std::swap(unoriented_w, unoriented_h);
+    }
+  } else {
+    fallback_reason_ = RegionFallbackReason::kNoRegion;
+    return;
+  }
+
+  const Rect unoriented_region = PassesDecoderState::ComputeUnorientedRegion(
+      output_region_, unoriented_w, unoriented_h, undo_orientation);
+  if (unoriented_region.xsize() == 0 || unoriented_region.ysize() == 0) {
+    fallback_reason_ = RegionFallbackReason::kNoRegion;
+    return;
+  }
+
+  bool has_blending = frame_header_.blending_info.mode != BlendMode::kReplace ||
+                      frame_header_.custom_size_or_origin;
+  for (const auto& blending_info_ec :
+       frame_header_.extra_channel_blending_info) {
+    if (blending_info_ec.mode != BlendMode::kReplace) has_blending = true;
+  }
+  const bool apply_origin = coalescing_ && has_blending;
+
+  RectT<ptrdiff_t> region(unoriented_region.x0(), unoriented_region.y0(),
+                          unoriented_region.xsize(), unoriented_region.ysize());
+  RectT<ptrdiff_t> frame_in_image(0, 0, frame_dim_.xsize_upsampled,
+                                  frame_dim_.ysize_upsampled);
+  if (apply_origin) {
+    frame_in_image = frame_in_image.Translate(frame_header_.frame_origin.x0,
+                                              frame_header_.frame_origin.y0);
+  }
+  RectT<ptrdiff_t> isect = region.Intersection(frame_in_image);
+
+  fallback_reason_ = RegionFallbackReason::kNone;
+  can_skip_ac_groups_ = true;
+  required_ac_groups_.assign(frame_dim_.num_groups, 0);
+  size_t num_required_groups = 0;
+
+  if (isect.xsize() > 0 && isect.ysize() > 0) {
+    if (apply_origin) {
+      isect = isect.Translate(-frame_header_.frame_origin.x0,
+                              -frame_header_.frame_origin.y0);
+    }
+    const size_t base_shift =
+        (after_dc_global && dec_state_->render_pipeline)
+            ? dec_state_->render_pipeline->BaseColorShift()
+            : CeilLog2Nonzero(frame_header_.upsampling);
+    const std::pair<size_t, size_t> group_border =
+        (after_dc_global && dec_state_->render_pipeline)
+            ? dec_state_->render_pipeline->GroupBorder()
+            : EstimateGroupBorderFromHeader();
+    const size_t bx = group_border.first;
+    const size_t by = group_border.second;
+
+    const size_t fx0 = static_cast<size_t>(isect.x0());
+    const size_t fy0 = static_cast<size_t>(isect.y0());
+    const size_t fx1 = static_cast<size_t>(isect.x1());
+    const size_t fy1 = static_cast<size_t>(isect.y1());
+
+    const size_t cx0 = fx0 >> base_shift;
+    const size_t cy0 = fy0 >> base_shift;
+    const size_t cx1 =
+        std::min(frame_dim_.xsize, DivCeil(fx1, size_t{1} << base_shift));
+    const size_t cy1 =
+        std::min(frame_dim_.ysize, DivCeil(fy1, size_t{1} << base_shift));
+
+    const size_t ex0 = (cx0 > bx) ? (cx0 - bx) : 0;
+    const size_t ey0 = (cy0 > by) ? (cy0 - by) : 0;
+    const size_t ex1 = std::min(frame_dim_.xsize, cx1 + bx);
+    const size_t ey1 = std::min(frame_dim_.ysize, cy1 + by);
+
+    const size_t gx0 = ex0 / frame_dim_.group_dim;
+    const size_t gy0 = ey0 / frame_dim_.group_dim;
+    const size_t gx1 =
+        std::min(frame_dim_.xsize_groups, DivCeil(ex1, frame_dim_.group_dim));
+    const size_t gy1 =
+        std::min(frame_dim_.ysize_groups, DivCeil(ey1, frame_dim_.group_dim));
+
+    for (size_t gy = gy0; gy < gy1; ++gy) {
+      for (size_t gx = gx0; gx < gx1; ++gx) {
+        required_ac_groups_[gy * frame_dim_.xsize_groups + gx] = 1;
+        ++num_required_groups;
+      }
+    }
+  }
+
+  num_required_groups_ = num_required_groups;
+  num_required_sections_ =
+      2 + frame_dim_.num_dc_groups +
+      num_required_groups * frame_header_.passes.num_passes;
+}
+
+void FrameDecoder::GetRequiredCodestreamRanges(
+    bool coalesce_adjacent, std::vector<ByteRange>* ranges) const {
+  ranges->clear();
+  for (size_t i = 0; i < toc_.size(); ++i) {
+    const size_t id = toc_[i].id;
+    const size_t sz = toc_[i].size;
+    if (sz == 0) continue;
+    if (id < processed_section_.size() && processed_section_[id]) continue;
+    if (!IsSectionRequiredPlanned(id)) continue;
+    const uint64_t off = section_codestream_offsets_[i];
+    if (coalesce_adjacent && !ranges->empty() &&
+        ranges->back().offset + ranges->back().length == off) {
+      ranges->back().length += sz;
+    } else {
+      ranges->push_back(ByteRange{off, sz});
+    }
+  }
+}
+
+FrameDecoder::RegionDecodeStats FrameDecoder::GetRegionDecodeStats() const {
+  RegionDecodeStats stats;
+  stats.fallback_reason = fallback_reason_;
+  stats.total_groups = frame_dim_.num_groups;
+  stats.required_groups = num_required_groups_;
+  stats.skipped_groups =
+      (frame_dim_.num_groups >= num_required_groups_)
+          ? (frame_dim_.num_groups - num_required_groups_)
+          : 0;
+  stats.total_sections = toc_.size();
+  stats.required_sections = num_required_sections_;
+  stats.total_frame_payload_bytes = section_sizes_sum_;
+  return stats;
+}
+
 Status FrameDecoder::Flush() {
   bool has_blending = frame_header_.blending_info.mode != BlendMode::kReplace ||
                       frame_header_.custom_size_or_origin;
@@ -755,12 +1003,12 @@ Status FrameDecoder::Flush() {
   }
   JXL_RETURN_IF_ERROR(AllocateOutput());
 
-  uint32_t completely_decoded_ac_pass = *std::min_element(
-      decoded_passes_per_ac_group_.begin(), decoded_passes_per_ac_group_.end());
+  uint32_t completely_decoded_ac_pass = NumCompletePasses();
   if (completely_decoded_ac_pass < frame_header_.passes.num_passes) {
     // We don't have all AC yet: force a draw of all the missing areas.
     // Mark all sections as not complete.
     for (size_t i = 0; i < decoded_passes_per_ac_group_.size(); i++) {
+      if (can_skip_ac_groups_ && !required_ac_groups_[i]) continue;
       if (decoded_passes_per_ac_group_[i] < frame_header_.passes.num_passes) {
         dec_state_->render_pipeline->ClearDone(i);
       }
@@ -772,6 +1020,9 @@ Status FrameDecoder::Flush() {
     };
     const auto process_group = [this](const uint32_t g,
                                       size_t thread) -> Status {
+      if (can_skip_ac_groups_ && !required_ac_groups_[g]) {
+        return true;
+      }
       if (decoded_passes_per_ac_group_[g] == frame_header_.passes.num_passes) {
         // This group was drawn already, nothing to do.
         return true;
@@ -810,8 +1061,11 @@ bool FrameDecoder::HasEverything() const {
   if (!decoded_dc_global_) return false;
   if (!decoded_ac_global_) return false;
   if (HasDcGroupToDecode()) return false;
-  for (const auto& nb_passes : decoded_passes_per_ac_group_) {
-    if (nb_passes < frame_header_.passes.num_passes) return false;
+  for (size_t g = 0; g < decoded_passes_per_ac_group_.size(); ++g) {
+    if (can_skip_ac_groups_ && !required_ac_groups_[g]) continue;
+    if (decoded_passes_per_ac_group_[g] < frame_header_.passes.num_passes) {
+      return false;
+    }
   }
   return true;
 }
@@ -869,6 +1123,11 @@ Status FrameDecoder::FinalizeFrame() {
   JXL_RETURN_IF_ERROR(
       modular_frame_decoder_.FinalizeDecoding(frame_header_, dec_state_, pool_,
                                               /*inplace=*/true));
+
+  if (dec_state_->render_pipeline) {
+    JXL_RETURN_IF_ERROR(
+        dec_state_->render_pipeline->RenderOutOfFramePadding(0));
+  }
 
   if (frame_header_.CanBeReferenced()) {
     auto& info = dec_state_->shared_storage

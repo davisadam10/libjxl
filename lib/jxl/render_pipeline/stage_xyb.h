@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "lib/jxl/base/rect.h"
 #include "lib/jxl/dec_xyb.h"
 #include "lib/jxl/render_pipeline/render_pipeline_stage.h"
 
@@ -23,7 +24,7 @@ std::unique_ptr<RenderPipelineStage> GetXYBStage(
 // write to a uint8 buffer.
 std::unique_ptr<RenderPipelineStage> GetFastXYBTosRGB8Stage(
     uint8_t* rgb, size_t stride, size_t width, size_t height, bool rgba,
-    bool has_alpha, size_t alpha_c);
+    bool has_alpha, size_t alpha_c, const Rect& output_region = Rect());
 }  // namespace jxl
 
 #endif  // LIB_JXL_RENDER_PIPELINE_STAGE_XYB_H_

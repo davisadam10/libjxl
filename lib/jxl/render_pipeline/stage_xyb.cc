@@ -134,12 +134,16 @@ namespace {
 class FastXYBStage : public RenderPipelineStage {
  public:
   FastXYBStage(uint8_t* rgb, size_t stride, size_t width, size_t height,
-               bool rgba, bool has_alpha, size_t alpha_c)
+               bool rgba, bool has_alpha, size_t alpha_c,
+               const Rect& output_region)
       : RenderPipelineStage(RenderPipelineStage::Settings()),
         rgb_(rgb),
         stride_(stride),
         width_(width),
         height_(height),
+        output_region_(output_region.xsize() > 0 && output_region.ysize() > 0
+                           ? output_region
+                           : Rect(0, 0, width, height)),
         rgba_(rgba),
         has_alpha_(has_alpha),
         alpha_c_(alpha_c) {}
@@ -147,14 +151,20 @@ class FastXYBStage : public RenderPipelineStage {
   Status ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
                     size_t xextra_left, size_t xextra_right, size_t xsize,
                     size_t xpos, size_t ypos, size_t thread_id) const final {
-    if (ypos >= height_) return true;
+    if (ypos < output_region_.y0() || ypos >= output_region_.y1()) return true;
     JXL_ENSURE(xextra_left == 0 && xextra_right == 0);
+    size_t clip_x0 = std::max(xpos, output_region_.x0());
+    size_t clip_x1 = std::min(xpos + xsize, output_region_.x1());
+    if (clip_x0 >= clip_x1) return true;
+    size_t x_off = clip_x0 - xpos;
     const float* xyba[4] = {
-        GetInputRow(input_rows, 0, 0), GetInputRow(input_rows, 1, 0),
-        GetInputRow(input_rows, 2, 0),
-        has_alpha_ ? GetInputRow(input_rows, alpha_c_, 0) : nullptr};
-    uint8_t* out_buf = rgb_ + stride_ * ypos + (rgba_ ? 4 : 3) * xpos;
-    size_t x_span = std::min<size_t>(xsize, width_ - xpos);
+        GetInputRow(input_rows, 0, 0) + x_off,
+        GetInputRow(input_rows, 1, 0) + x_off,
+        GetInputRow(input_rows, 2, 0) + x_off,
+        has_alpha_ ? GetInputRow(input_rows, alpha_c_, 0) + x_off : nullptr};
+    uint8_t* out_buf = rgb_ + stride_ * (ypos - output_region_.y0()) +
+                       (rgba_ ? 4 : 3) * (clip_x0 - output_region_.x0());
+    size_t x_span = clip_x1 - clip_x0;
     return FastXYBTosRGB8(xyba, out_buf, rgba_, x_span);
   }
 
@@ -171,6 +181,7 @@ class FastXYBStage : public RenderPipelineStage {
   size_t stride_;
   size_t width_;
   size_t height_;
+  Rect output_region_;
   bool rgba_;
   bool has_alpha_;
   size_t alpha_c_;
@@ -181,10 +192,10 @@ class FastXYBStage : public RenderPipelineStage {
 
 std::unique_ptr<RenderPipelineStage> GetFastXYBTosRGB8Stage(
     uint8_t* rgb, size_t stride, size_t width, size_t height, bool rgba,
-    bool has_alpha, size_t alpha_c) {
+    bool has_alpha, size_t alpha_c, const Rect& output_region) {
   if (!HasFastXYBTosRGB8()) return nullptr;
   return make_unique<FastXYBStage>(rgb, stride, width, height, rgba, has_alpha,
-                                   alpha_c);
+                                   alpha_c, output_region);
 }
 #endif
 

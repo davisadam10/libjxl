@@ -291,7 +291,8 @@ class WriteToOutputStage : public RenderPipelineStage {
                      size_t height, bool has_alpha, bool unpremul_alpha,
                      size_t alpha_c, Orientation undo_orientation,
                      const std::vector<ImageOutput>& extra_output,
-                     JxlMemoryManager* memory_manager)
+                     JxlMemoryManager* memory_manager,
+                     const Rect& output_region, const Rect& unoriented_region)
       : RenderPipelineStage(RenderPipelineStage::Settings()),
         width_(width),
         height_(height),
@@ -304,6 +305,15 @@ class WriteToOutputStage : public RenderPipelineStage {
         flip_x_(ShouldFlipX(undo_orientation)),
         flip_y_(ShouldFlipY(undo_orientation)),
         transpose_(ShouldTranspose(undo_orientation)),
+        output_region_(
+            output_region.xsize() > 0 && output_region.ysize() > 0
+                ? output_region
+                : Rect(0, 0, transpose_ ? height : width,
+                       transpose_ ? width : height)),
+        unoriented_region_(
+            unoriented_region.xsize() > 0 && unoriented_region.ysize() > 0
+                ? unoriented_region
+                : Rect(0, 0, width, height)),
         opaque_alpha_(kChunkSize, 1.0f),
         memory_manager_(memory_manager) {
     for (size_t ec = 0; ec < extra_output.size(); ++ec) {
@@ -336,22 +346,28 @@ class WriteToOutputStage : public RenderPipelineStage {
                     size_t xpos, size_t ypos, size_t thread_id) const final {
     JXL_ENSURE(xextra_left == 0 && xextra_right == 0);
     JXL_ENSURE(main_.run_opaque_ || main_.buffer_);
-    if (ypos >= height_) return true;
-    if (xpos >= width_) return true;
+    if (ypos < unoriented_region_.y0() || ypos >= unoriented_region_.y1()) {
+      return true;
+    }
+    size_t clip_x0 = std::max(xpos, unoriented_region_.x0());
+    size_t clip_x1 = std::min(xpos + xsize, unoriented_region_.x1());
+    if (clip_x0 >= clip_x1) return true;
     if (flip_y_) {
       ypos = height_ - 1u - ypos;
     }
-    size_t limit = std::min(xsize, width_ - xpos);
+    size_t row_offset = clip_x0 - xpos;
+    size_t limit = clip_x1 - clip_x0;
     for (size_t x0 = 0; x0 < limit; x0 += kChunkSize) {
-      size_t xstart = xpos + x0;
+      size_t xstart = clip_x0 + x0;
       size_t len = std::min<size_t>(kChunkSize, limit - x0);
 
       const float* line_buffers[4];
       for (size_t c = 0; c < num_color_; c++) {
-        line_buffers[c] = GetInputRow(input_rows, c, 0) + x0;
+        line_buffers[c] = GetInputRow(input_rows, c, 0) + row_offset + x0;
       }
       if (has_alpha_) {
-        line_buffers[num_color_] = GetInputRow(input_rows, alpha_c_, 0) + x0;
+        line_buffers[num_color_] =
+            GetInputRow(input_rows, alpha_c_, 0) + row_offset + x0;
       } else {
         // opaque_alpha_ is a way to set all values to 1.0f.
         line_buffers[num_color_] = opaque_alpha_.data();
@@ -361,7 +377,8 @@ class WriteToOutputStage : public RenderPipelineStage {
       }
       OutputBuffers(main_, thread_id, ypos, xstart, len, line_buffers);
       for (const auto& extra : extra_channels_) {
-        line_buffers[0] = GetInputRow(input_rows, extra.channel_index_, 0) + x0;
+        line_buffers[0] =
+            GetInputRow(input_rows, extra.channel_index_, 0) + row_offset + x0;
         OutputBuffers(extra, thread_id, ypos, xstart, len, line_buffers);
       }
     }
@@ -663,14 +680,16 @@ class WriteToOutputStage : public RenderPipelineStage {
                      size_t xstart, size_t len, T* output) const {
     if (transpose_) {
       // TODO(szabadka) Buffer 8x8 chunks and transpose with SIMD.
+      const size_t out_x = ypos - output_region_.x0();
+      const size_t out_y = xstart - output_region_.y0();
       if (out.run_opaque_) {
         for (size_t i = 0, j = 0; i < len; ++i, j += out.num_channels_) {
-          out.pixel_callback_.run(out.run_opaque_, thread_id, ypos, xstart + i,
+          out.pixel_callback_.run(out.run_opaque_, thread_id, out_x, out_y + i,
                                   1, output + j);
         }
       } else {
         const size_t pixel_stride = out.num_channels_ * sizeof(T);
-        const size_t offset = xstart * out.stride_ + ypos * pixel_stride;
+        const size_t offset = out_y * out.stride_ + out_x * pixel_stride;
         for (size_t i = 0, j = 0; i < len; ++i, j += out.num_channels_) {
           const size_t ix = offset + i * out.stride_;
           JXL_DASSERT(ix + pixel_stride <= out.buffer_size_);
@@ -679,12 +698,14 @@ class WriteToOutputStage : public RenderPipelineStage {
         }
       }
     } else {
+      const size_t out_x = xstart - output_region_.x0();
+      const size_t out_y = ypos - output_region_.y0();
       if (out.run_opaque_) {
-        out.pixel_callback_.run(out.run_opaque_, thread_id, xstart, ypos, len,
+        out.pixel_callback_.run(out.run_opaque_, thread_id, out_x, out_y, len,
                                 output);
       } else {
         const size_t pixel_stride = out.num_channels_ * sizeof(T);
-        const size_t offset = ypos * out.stride_ + xstart * pixel_stride;
+        const size_t offset = out_y * out.stride_ + out_x * pixel_stride;
         JXL_DASSERT(offset + len * pixel_stride <= out.buffer_size_);
         memcpy(reinterpret_cast<uint8_t*>(out.buffer_) + offset, output,
                len * pixel_stride);
@@ -704,6 +725,8 @@ class WriteToOutputStage : public RenderPipelineStage {
   bool flip_x_;
   bool flip_y_;
   bool transpose_;
+  Rect output_region_;
+  Rect unoriented_region_;
   std::vector<Output> extra_channels_;
   std::vector<float> opaque_alpha_;
   JxlMemoryManager* memory_manager_;
@@ -714,10 +737,12 @@ class WriteToOutputStage : public RenderPipelineStage {
 std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
     const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
     bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
-    std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager) {
+    std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager,
+    const Rect& output_region, const Rect& unoriented_region) {
   return jxl::make_unique<WriteToOutputStage>(
       main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
-      undo_orientation, extra_output, memory_manager);
+      undo_orientation, extra_output, memory_manager, output_region,
+      unoriented_region);
 }
 
 // NOLINTNEXTLINE(google-readability-namespace-comments)
@@ -851,10 +876,12 @@ std::unique_ptr<RenderPipelineStage> GetWriteToImage3FStage(
 std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
     const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
     bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
-    std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager) {
+    std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager,
+    const Rect& output_region, const Rect& unoriented_region) {
   return HWY_DYNAMIC_DISPATCH(GetWriteToOutputStage)(
       main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
-      undo_orientation, extra_output, memory_manager);
+      undo_orientation, extra_output, memory_manager, output_region,
+      unoriented_region);
 }
 
 }  // namespace jxl
