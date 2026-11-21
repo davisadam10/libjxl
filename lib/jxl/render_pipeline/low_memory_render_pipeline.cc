@@ -974,6 +974,92 @@ Status LowMemoryRenderPipeline::RenderPadding(size_t thread_id, Rect rect) {
   return true;
 }
 
+void LowMemoryRenderPipeline::SetRenderRegion(
+    const Rect& unoriented_image_region) {
+  if (unoriented_image_region.xsize() == 0 ||
+      unoriented_image_region.ysize() == 0) {
+    has_render_region_ = false;
+    return;
+  }
+  has_render_region_ = true;
+  render_image_rect_ = unoriented_image_region;
+  RectT<ptrdiff_t> region(unoriented_image_region.x0(),
+                          unoriented_image_region.y0(),
+                          unoriented_image_region.xsize(),
+                          unoriented_image_region.ysize());
+  RectT<ptrdiff_t> frame_in_image(0, 0, frame_dimensions_.xsize_upsampled,
+                                  frame_dimensions_.ysize_upsampled);
+  if (first_image_dim_stage_ != stages_.size()) {
+    frame_in_image =
+        frame_in_image.Translate(frame_origin_.x0, frame_origin_.y0);
+  }
+  RectT<ptrdiff_t> isect = region.Intersection(frame_in_image);
+  if (isect.xsize() == 0 || isect.ysize() == 0) {
+    render_color_rect_ = Rect(0, 0, 0, 0);
+    return;
+  }
+  if (first_image_dim_stage_ != stages_.size()) {
+    isect = isect.Translate(-frame_origin_.x0, -frame_origin_.y0);
+  }
+  size_t fx0 = static_cast<size_t>(isect.x0());
+  size_t fy0 = static_cast<size_t>(isect.y0());
+  size_t fx1 = static_cast<size_t>(isect.x1());
+  size_t fy1 = static_cast<size_t>(isect.y1());
+  size_t cx0 = fx0 >> base_color_shift_;
+  size_t cy0 = fy0 >> base_color_shift_;
+  size_t cx1 = std::min(frame_dimensions_.xsize,
+                        DivCeil(fx1, size_t{1} << base_color_shift_));
+  size_t cy1 = std::min(frame_dimensions_.ysize,
+                        DivCeil(fy1, size_t{1} << base_color_shift_));
+  render_color_rect_ = Rect(cx0, cy0, cx1 - cx0, cy1 - cy0);
+}
+
+Status LowMemoryRenderPipeline::RenderOutOfFramePadding(size_t thread_id) {
+  if (!has_render_region_ || first_image_dim_stage_ == stages_.size()) {
+    return true;
+  }
+  if (out_of_frame_data_.size() <= thread_id) {
+    JXL_RETURN_IF_ERROR(PrepareForThreads(thread_id + 1, use_group_ids_));
+  }
+  RectT<ptrdiff_t> full_image_rect(0, 0, full_image_xsize_, full_image_ysize_);
+  RectT<ptrdiff_t> frame_rect(0, 0, frame_dimensions_.xsize_upsampled,
+                              frame_dimensions_.ysize_upsampled);
+  frame_rect = frame_rect.Translate(frame_origin_.x0, frame_origin_.y0);
+  frame_rect = frame_rect.Intersection(full_image_rect);
+
+  size_t rx0 = render_image_rect_.x0();
+  size_t ry0 = render_image_rect_.y0();
+  size_t rx1 = render_image_rect_.x1();
+  size_t ry1 = render_image_rect_.y1();
+
+  RectT<ptrdiff_t> r_signed(rx0, ry0, rx1 - rx0, ry1 - ry0);
+  RectT<ptrdiff_t> overlap = r_signed.Intersection(frame_rect);
+  if (overlap.xsize() == 0 || overlap.ysize() == 0) {
+    return RenderPadding(thread_id, render_image_rect_);
+  }
+  size_t ox0 = static_cast<size_t>(overlap.x0());
+  size_t oy0 = static_cast<size_t>(overlap.y0());
+  size_t ox1 = static_cast<size_t>(overlap.x1());
+  size_t oy1 = static_cast<size_t>(overlap.y1());
+  if (ry0 < oy0) {
+    JXL_RETURN_IF_ERROR(
+        RenderPadding(thread_id, Rect(rx0, ry0, rx1 - rx0, oy0 - ry0)));
+  }
+  if (oy1 < ry1) {
+    JXL_RETURN_IF_ERROR(
+        RenderPadding(thread_id, Rect(rx0, oy1, rx1 - rx0, ry1 - oy1)));
+  }
+  if (rx0 < ox0) {
+    JXL_RETURN_IF_ERROR(
+        RenderPadding(thread_id, Rect(rx0, oy0, ox0 - rx0, oy1 - oy0)));
+  }
+  if (ox1 < rx1) {
+    JXL_RETURN_IF_ERROR(
+        RenderPadding(thread_id, Rect(ox1, oy0, rx1 - ox1, oy1 - oy0)));
+  }
+  return true;
+}
+
 Status LowMemoryRenderPipeline::ProcessBuffers(size_t group_id,
                                                size_t thread_id) {
   std::vector<ImageF>& input_data =
@@ -987,7 +1073,7 @@ Status LowMemoryRenderPipeline::ProcessBuffers(size_t group_id,
   size_t gy = group_id / frame_dimensions_.xsize_groups;
   size_t gx = group_id % frame_dimensions_.xsize_groups;
 
-  if (first_image_dim_stage_ != stages_.size()) {
+  if (first_image_dim_stage_ != stages_.size() && !has_render_region_) {
     size_t group_dim = frame_dimensions_.group_dim << base_color_shift_;
     RectT<ptrdiff_t> group_rect(gx * group_dim, gy * group_dim, group_dim,
                                 group_dim);
@@ -1060,6 +1146,13 @@ Status LowMemoryRenderPipeline::ProcessBuffers(size_t group_id,
                                    &num_ready_rects);
   for (size_t i = 0; i < num_ready_rects; i++) {
     const Rect& image_max_color_channel_rect = ready_rects[i];
+    if (has_render_region_) {
+      Rect isect =
+          image_max_color_channel_rect.Intersection(render_color_rect_);
+      if (isect.xsize() == 0 || isect.ysize() == 0) {
+        continue;
+      }
+    }
     for (size_t c = 0; c < input_data.size(); c++) {
       JXL_RETURN_IF_ERROR(LoadBorders(group_id, c, image_max_color_channel_rect,
                                       &input_data[c]));
