@@ -70,7 +70,7 @@ flowchart TD
 >    - `JxlDecoderExperimentalGetRegionDecodeStats(dec, stats)`
 > 2. **ACES2065-1 RGB HALF Test Sizing**:
 >    - The main `decode_region_test` suite runs a fast **2K (2048×1080) ACES2065-1 RGB HALF (`JXL_TYPE_FLOAT16`)** lossless Modular sparse-I/O test plus the **all-65,536 HALF bit-pattern (#3881)** test.
->    - The full **8K (7680×4320) ACES2065-1 RGB HALF** sparse-I/O performance/metrics test is kept as a separate `DISABLED_Aces8kRgbHalfSparseBenchmark` test (invocable on demand via `--gtest_also_run_disabled_tests --gtest_filter=*Aces8k*`) so the default unit test run remains fast.
+>    - The full **8K (7680×4320) ACES2065-1 RGB HALF** sparse-I/O performance/metrics test is kept as a separate `DISABLED_Float8kRgbHalfSparseBenchmark` test (invocable on demand via `--gtest_also_run_disabled_tests --gtest_filter=*Float8k*`) so the default unit test run remains fast.
 
 ---
 
@@ -162,7 +162,7 @@ flowchart TD
    - Test **security & API validation**: out-of-bounds ROI, `SIZE_MAX` overflow, invalid sparse offsets, out-of-order/duplicate ranges, `Rewind` + region change.
 3. **ACES2065-1 RGB HALF Sparse-I/O & Performance Tests**:
    - **Main suite (fast)**: 2K (2048×1080) ACES2065-1 RGB HALF lossless Modular frame, decoding 256×256 and 512×512 crops via sparse random-access vs. full decode, verifying bit-exact pixel equality and minimal bytes read / groups decoded.
-   - **Separate benchmark (`DISABLED_Aces8kRgbHalfSparseBenchmark`)**: Full 8K (7680×4320) ACES2065-1 RGB HALF lossless Modular frame, decoding a 512×512 crop via sparse random-access vs. full decode, reporting bytes read, range count, groups decoded vs. skipped, wall-clock latency, and bit-exact pixel equality.
+   - **Separate benchmark (`DISABLED_Float8kRgbHalfSparseBenchmark`)**: Full 8K (7680×4320) ACES2065-1 RGB HALF lossless Modular frame, decoding a 512×512 crop via sparse random-access vs. full decode, reporting bytes read, range count, groups decoded vs. skipped, wall-clock latency, and bit-exact pixel equality.
 
 ### Build & Run Commands
 ```bash
@@ -171,5 +171,5 @@ ninja -C build decode_region_test decode_test render_pipeline_test
 ./build/lib/tests/decode_test
 ./build/lib/tests/render_pipeline_test
 # Optional 8K ACES HALF sparse benchmark:
-./build/lib/tests/decode_region_test --gtest_also_run_disabled_tests --gtest_filter=*Aces8k*
+./build/lib/tests/decode_region_test --gtest_also_run_disabled_tests --gtest_filter=*Float8k*
 ```
