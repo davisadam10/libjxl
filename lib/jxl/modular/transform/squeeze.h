@@ -86,6 +86,10 @@ Status MetaSqueeze(Image &image, std::vector<SqueezeParams> *parameters);
 Status InvSqueeze(Image &input, const std::vector<SqueezeParams> &parameters,
                   ThreadPool *pool);
 
+Status PartialInvSqueeze(Image &input,
+                         const std::vector<SqueezeParams> &parameters,
+                         int target_shift, ThreadPool *pool);
+
 }  // namespace jxl
 
 #endif  // LIB_JXL_MODULAR_TRANSFORM_SQUEEZE_H_
