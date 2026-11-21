@@ -64,8 +64,40 @@ typedef enum {
 } JxlExperimentalRegionFallbackReason;
 
 /**
+ * Exactness / fallback policy for reduced-resolution decoding.
+ */
+typedef enum {
+  /** Use the fastest native codec path available (VarDCT 1:8 DC, Modular
+   * Squeeze partial inverse, progressive pass skip), falling back to streaming
+   * float box downsampling if the bitstream has no native low-res path. */
+  JXL_EXP_SCALE_FAST_APPROXIMATE = 0,
+  /** Require a fast native path that avoids full-resolution decode; return
+   * JXL_DEC_ERROR if no native reduced-resolution path exists for this frame. */
+  JXL_EXP_SCALE_REQUIRE_FAST_NATIVE = 1,
+  /** Always decode full-resolution pixels (within any active ROI) and apply
+   * the defined unclamped float box/area downsample (reference-accurate). */
+  JXL_EXP_SCALE_REFERENCE_RESAMPLE = 2,
+} JxlExperimentalScalePolicy;
+
+/**
+ * Reports which reduced-resolution decode strategy was selected for the frame.
+ */
+typedef enum {
+  /** Full resolution (downsampling == 1). */
+  JXL_EXP_SCALE_MODE_NONE = 0,
+  /** Native VarDCT 1:8 DC-only path (skips AC Global and all AC/HF groups). */
+  JXL_EXP_SCALE_MODE_NATIVE_VARDCT_DC = 1,
+  /** Native Modular Squeeze partial inverse (skips fine ModularAC passes). */
+  JXL_EXP_SCALE_MODE_MODULAR_SQUEEZE_NATIVE = 2,
+  /** Progressive VarDCT pass skipping + streaming float box downsample. */
+  JXL_EXP_SCALE_MODE_PROGRESSIVE_PASS_SKIP = 3,
+  /** Full-resolution group decode + low-memory streaming float box downsample. */
+  JXL_EXP_SCALE_MODE_STREAMING_DOWNSAMPLE_FALLBACK = 4,
+} JxlExperimentalScaleDecodeMode;
+
+/**
  * Diagnostic and efficiency statistics for the current/most recent frame's
- * region decode.
+ * region and/or reduced-resolution decode.
  */
 typedef struct {
   /** Fallback reason (JXL_EXP_FALLBACK_NONE if selective skipping occurred). */
@@ -87,14 +119,78 @@ typedef struct {
   uint64_t planned_bytes_to_read;
   /** Total compressed payload bytes in the frame's TOC. */
   uint64_t total_frame_payload_bytes;
+  /** Configured output downsampling factor (1, 2, 4, or 8). */
+  uint32_t downsampling;
+  /** Configured reduced-resolution exactness policy. */
+  JxlExperimentalScalePolicy scale_policy;
+  /** Effective reduced-resolution decode strategy selected for the frame. */
+  JxlExperimentalScaleDecodeMode scale_mode;
+  /** Total passes in the frame. */
+  size_t total_passes;
+  /** Number of passes required/decoded for the configured scale target. */
+  size_t required_passes;
 } JxlExperimentalRegionDecodeStats;
+
+/**
+ * Sets power-of-two output downsampling factor (1, 2, 4, or 8) and exactness
+ * policy for subsequent frames.
+ *
+ * When factor > 1:
+ * - Effective output canvas dimensions become
+ *   DivCeil(oriented_w, factor) x DivCeil(oriented_h, factor).
+ * - @ref JxlDecoderGetBasicInfo continues to report original full-image
+ *   dimensions for backward compatibility.
+ * - @ref JxlDecoderImageOutBufferSize and @ref JxlDecoderExtraChannelBufferSize
+ *   return buffer sizes for the effective downsampled dimensions (or active
+ *   output region in downsampled coordinates).
+ * - If combined with @ref JxlDecoderExperimentalSetOutputRegion, region
+ *   coordinates (x, y, width, height) are specified in downsampled output
+ *   coordinates [0, DivCeil(W, factor)) x [0, DivCeil(H, factor)).
+ *
+ * Must be called before setting the image output buffer for the current frame.
+ * Passing factor == 1 restores full-resolution decoding.
+ *
+ * @param dec decoder object
+ * @param factor power-of-two scale factor: 1, 2, 4, or 8
+ * @param policy exactness / fallback policy
+ * @return ::JXL_DEC_SUCCESS on success, ::JXL_DEC_ERROR on invalid parameters
+ *     or state.
+ */
+JXL_EXPORT JxlDecoderStatus JxlDecoderExperimentalSetOutputDownsampling(
+    JxlDecoder* dec, uint32_t factor, JxlExperimentalScalePolicy policy);
+
+/**
+ * Queries effective output dimensions (accounting for orientation,
+ * downsampling, and any active output region) and whether a fast native
+ * reduced-resolution decode path is available for the current frame.
+ *
+ * `width` and `height` are available after ::JXL_DEC_BASIC_INFO.
+ * `fast_native_available` and `scale_mode` reflect the current frame once its
+ * header and TOC have been parsed (and are refined after DC Global for Modular
+ * frames). Any output pointer may be NULL if not needed.
+ *
+ * @param dec decoder object
+ * @param width [out] effective output width in pixels (may be NULL)
+ * @param height [out] effective output height in pixels (may be NULL)
+ * @param fast_native_available [out] JXL_TRUE if a native fast path that avoids
+ *     full-resolution decode is available (may be NULL)
+ * @param scale_mode [out] selected reduced-resolution decode mode (may be NULL)
+ * @return ::JXL_DEC_SUCCESS on success, ::JXL_DEC_ERROR if basic info is not
+ *     yet available or dec is NULL.
+ */
+JXL_EXPORT JxlDecoderStatus JxlDecoderExperimentalGetScaledOutputInfo(
+    const JxlDecoder* dec, uint32_t* width, uint32_t* height,
+    JXL_BOOL* fast_native_available,
+    JxlExperimentalScaleDecodeMode* scale_mode);
 
 /**
  * Sets the requested output region of interest (ROI) for subsequent frames.
  *
  * Coordinates (x, y) and dimensions (width, height) are specified in the final
  * output coordinate space (after applying EXIF orientation unless
- * @ref JxlDecoderSetKeepOrientation was called with JXL_TRUE).
+ * @ref JxlDecoderSetKeepOrientation was called with JXL_TRUE, and in
+ * downsampled coordinates if @ref JxlDecoderExperimentalSetOutputDownsampling
+ * was set to factor > 1).
  *
  * When set:
  * - @ref JxlDecoderImageOutBufferSize and @ref JxlDecoderExtraChannelBufferSize
@@ -122,7 +218,7 @@ JXL_EXPORT JxlDecoderStatus JxlDecoderExperimentalSetOutputRegion(
 
 /**
  * Queries the coalesced file byte ranges required to finish decoding the
- * current frame for the configured output region.
+ * current frame for the configured output region and downsampling target.
  *
  * Must be called after the frame header and TOC have been parsed (e.g. upon
  * receiving ::JXL_DEC_FRAME, ::JXL_DEC_NEED_IMAGE_OUT_BUFFER, or
@@ -178,7 +274,7 @@ JXL_EXPORT JxlDecoderStatus JxlDecoderExperimentalSetInputAtOffset(
 
 /**
  * Retrieves diagnostic and efficiency metrics for the current (or most
- * recently completed) frame's region decode.
+ * recently completed) frame's region and/or reduced-resolution decode.
  *
  * @param dec decoder object
  * @param stats output struct to populate

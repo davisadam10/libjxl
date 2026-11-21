@@ -121,6 +121,13 @@ class RenderPipeline {
   virtual void SetRenderRegion(const Rect& unoriented_image_region) {}
   virtual Status RenderOutOfFramePadding(size_t thread_id) { return true; }
 
+  Status FinalizeOutput() {
+    for (auto& stage : stages_) {
+      JXL_RETURN_IF_ERROR(stage->FinalizeOutput());
+    }
+    return true;
+  }
+
  protected:
   explicit RenderPipeline(JxlMemoryManager* memory_manager)
       : memory_manager_(memory_manager) {}

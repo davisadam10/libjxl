@@ -478,6 +478,8 @@ struct JxlDecoder {
   size_t decode_region_y0;
   size_t decode_region_width;
   size_t decode_region_height;
+  uint32_t output_downsampling;
+  JxlExperimentalScalePolicy scale_policy;
 
   // Exact file offset where the current frame's section payload (after TOC)
   // begins, valid when the frame's codestream bytes are contiguous in the file.
@@ -882,6 +884,8 @@ void JxlDecoderReset(JxlDecoder* dec) {
   dec->decode_region_y0 = 0;
   dec->decode_region_width = 0;
   dec->decode_region_height = 0;
+  dec->output_downsampling = 1;
+  dec->scale_policy = JXL_EXP_SCALE_FAST_APPROXIMATE;
   dec->desired_intensity_target = 0;
   dec->orig_events_wanted = 0;
   dec->events_wanted = 0;
@@ -1030,15 +1034,65 @@ JxlDecoderStatus JxlDecoderSetCoalescing(JxlDecoder* dec, JXL_BOOL coalescing) {
 
 namespace {
 bool ValidateDecodeRegionBounds(const JxlDecoder* dec, size_t x0, size_t y0,
-                                size_t width, size_t height) {
-  const size_t img_w = dec->metadata.oriented_xsize(dec->keep_orientation);
-  const size_t img_h = dec->metadata.oriented_ysize(dec->keep_orientation);
+                                size_t width, size_t height,
+                                uint32_t downsampling_override = 0) {
+  const size_t eff_ds =
+      (downsampling_override > 0)
+          ? downsampling_override
+          : (dec->output_downsampling > 1 ? dec->output_downsampling : 1);
+  const size_t img_w =
+      jxl::DivCeil(dec->metadata.oriented_xsize(dec->keep_orientation), eff_ds);
+  const size_t img_h =
+      jxl::DivCeil(dec->metadata.oriented_ysize(dec->keep_orientation), eff_ds);
   size_t x1 = 0;
   size_t y1 = 0;
   if (!jxl::SafeAdd(x0, width, x1) || !jxl::SafeAdd(y0, height, y1)) {
     return false;
   }
   return x1 <= img_w && y1 <= img_h;
+}
+
+jxl::FrameDecoder::ScalePolicy ToFrameScalePolicy(
+    JxlExperimentalScalePolicy p) {
+  switch (p) {
+    case JXL_EXP_SCALE_FAST_APPROXIMATE:
+      return jxl::FrameDecoder::ScalePolicy::kFastApproximate;
+    case JXL_EXP_SCALE_REQUIRE_FAST_NATIVE:
+      return jxl::FrameDecoder::ScalePolicy::kRequireFastNative;
+    case JXL_EXP_SCALE_REFERENCE_RESAMPLE:
+      return jxl::FrameDecoder::ScalePolicy::kReferenceResample;
+  }
+  return jxl::FrameDecoder::ScalePolicy::kFastApproximate;
+}
+
+JxlExperimentalScalePolicy ToExperimentalScalePolicy(
+    jxl::FrameDecoder::ScalePolicy p) {
+  switch (p) {
+    case jxl::FrameDecoder::ScalePolicy::kFastApproximate:
+      return JXL_EXP_SCALE_FAST_APPROXIMATE;
+    case jxl::FrameDecoder::ScalePolicy::kRequireFastNative:
+      return JXL_EXP_SCALE_REQUIRE_FAST_NATIVE;
+    case jxl::FrameDecoder::ScalePolicy::kReferenceResample:
+      return JXL_EXP_SCALE_REFERENCE_RESAMPLE;
+  }
+  return JXL_EXP_SCALE_FAST_APPROXIMATE;
+}
+
+JxlExperimentalScaleDecodeMode ToExperimentalScaleMode(
+    jxl::FrameDecoder::ScaleDecodeMode m) {
+  switch (m) {
+    case jxl::FrameDecoder::ScaleDecodeMode::kNone:
+      return JXL_EXP_SCALE_MODE_NONE;
+    case jxl::FrameDecoder::ScaleDecodeMode::kNativeVarDCTDC:
+      return JXL_EXP_SCALE_MODE_NATIVE_VARDCT_DC;
+    case jxl::FrameDecoder::ScaleDecodeMode::kModularSqueezeNative:
+      return JXL_EXP_SCALE_MODE_MODULAR_SQUEEZE_NATIVE;
+    case jxl::FrameDecoder::ScaleDecodeMode::kProgressivePassSkip:
+      return JXL_EXP_SCALE_MODE_PROGRESSIVE_PASS_SKIP;
+    case jxl::FrameDecoder::ScaleDecodeMode::kStreamingDownsampleFallback:
+      return JXL_EXP_SCALE_MODE_STREAMING_DOWNSAMPLE_FALLBACK;
+  }
+  return JXL_EXP_SCALE_MODE_NONE;
 }
 
 JxlExperimentalRegionFallbackReason ToExperimentalFallbackReason(
@@ -1064,6 +1118,9 @@ JxlExperimentalRegionFallbackReason ToExperimentalFallbackReason(
 
 void ApplyDecodeRegionToFrameDecoder(JxlDecoder* dec) {
   if (!dec->frame_dec) return;
+  dec->frame_dec->SetOutputDownsampling(
+      dec->preview_frame ? 1 : dec->output_downsampling,
+      ToFrameScalePolicy(dec->scale_policy));
   if (dec->has_decode_region && !dec->preview_frame) {
     const size_t xsize = dec->metadata.oriented_xsize(dec->keep_orientation);
     const size_t ysize = dec->metadata.oriented_ysize(dec->keep_orientation);
@@ -1098,6 +1155,11 @@ void PopulateRegionStats(const JxlDecoder* dec,
   stats->total_sections = fd_stats.total_sections;
   stats->required_sections = fd_stats.required_sections;
   stats->total_frame_payload_bytes = fd_stats.total_frame_payload_bytes;
+  stats->downsampling = static_cast<uint32_t>(fd_stats.downsampling);
+  stats->scale_policy = ToExperimentalScalePolicy(fd_stats.scale_policy);
+  stats->scale_mode = ToExperimentalScaleMode(fd_stats.scale_mode);
+  stats->total_passes = fd_stats.total_passes;
+  stats->required_passes = fd_stats.required_passes;
 
   std::vector<jxl::FrameDecoder::ByteRange> cs_ranges;
   dec->frame_dec->GetRequiredCodestreamRanges(/*coalesce_adjacent=*/true,
@@ -1128,6 +1190,79 @@ void MergeInterval(std::vector<std::pair<size_t, size_t>>* intervals,
   intervals->resize(write + 1);
 }
 }  // namespace
+
+JxlDecoderStatus JxlDecoderExperimentalSetOutputDownsampling(
+    JxlDecoder* dec, uint32_t downsampling, JxlExperimentalScalePolicy policy) {
+  if (!dec) {
+    return JXL_API_ERROR("Invalid decoder");
+  }
+  if (dec->image_out_buffer_set) {
+    return JXL_API_ERROR(
+        "Must set output downsampling before setting image output buffer");
+  }
+  if (downsampling != 1 && downsampling != 2 && downsampling != 4 &&
+      downsampling != 8) {
+    return JXL_API_ERROR("Downsampling factor must be 1, 2, 4, or 8");
+  }
+  if (policy != JXL_EXP_SCALE_FAST_APPROXIMATE &&
+      policy != JXL_EXP_SCALE_REQUIRE_FAST_NATIVE &&
+      policy != JXL_EXP_SCALE_REFERENCE_RESAMPLE) {
+    return JXL_API_ERROR("Invalid scale policy");
+  }
+  if (dec->got_basic_info && dec->has_decode_region &&
+      !ValidateDecodeRegionBounds(dec, dec->decode_region_x0,
+                                  dec->decode_region_y0,
+                                  dec->decode_region_width,
+                                  dec->decode_region_height, downsampling)) {
+    return JXL_API_ERROR(
+        "Output region out of bounds for requested downsampling");
+  }
+  dec->output_downsampling = downsampling;
+  dec->scale_policy = policy;
+  ApplyDecodeRegionToFrameDecoder(dec);
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus JxlDecoderExperimentalGetScaledOutputInfo(
+    const JxlDecoder* dec, uint32_t* xsize, uint32_t* ysize,
+    JXL_BOOL* fast_native_available,
+    JxlExperimentalScaleDecodeMode* scale_mode) {
+  if (!dec) {
+    return JXL_API_ERROR("Invalid decoder");
+  }
+  if (!dec->got_basic_info) {
+    return JXL_DEC_NEED_MORE_INPUT;
+  }
+  const size_t eff_ds =
+      dec->output_downsampling > 1 ? dec->output_downsampling : 1;
+  size_t out_w =
+      jxl::DivCeil(dec->metadata.oriented_xsize(dec->keep_orientation), eff_ds);
+  size_t out_h =
+      jxl::DivCeil(dec->metadata.oriented_ysize(dec->keep_orientation), eff_ds);
+  if (dec->has_decode_region && !dec->preview_frame) {
+    out_w = dec->decode_region_width;
+    out_h = dec->decode_region_height;
+  }
+  if (xsize) *xsize = static_cast<uint32_t>(out_w);
+  if (ysize) *ysize = static_cast<uint32_t>(out_h);
+  if (dec->frame_dec) {
+    if (fast_native_available) {
+      *fast_native_available =
+          dec->frame_dec->IsFastNativeScaleAvailable() ? JXL_TRUE : JXL_FALSE;
+    }
+    if (scale_mode) {
+      *scale_mode = ToExperimentalScaleMode(dec->frame_dec->GetScaleMode());
+    }
+  } else {
+    if (fast_native_available) {
+      *fast_native_available = (eff_ds == 1) ? JXL_TRUE : JXL_FALSE;
+    }
+    if (scale_mode) {
+      *scale_mode = JXL_EXP_SCALE_MODE_NONE;
+    }
+  }
+  return JXL_DEC_SUCCESS;
+}
 
 JxlDecoderStatus JxlDecoderExperimentalSetOutputRegion(JxlDecoder* dec,
                                                        uint32_t x, uint32_t y,
@@ -2948,6 +3083,10 @@ static JxlDecoderStatus GetMinSize(const JxlDecoder* dec,
     ysize = dec->decode_region_height;
   } else {
     GetCurrentDimensions(dec, xsize, ysize);
+    if (dec->output_downsampling > 1) {
+      xsize = jxl::DivCeil<size_t>(xsize, dec->output_downsampling);
+      ysize = jxl::DivCeil<size_t>(ysize, dec->output_downsampling);
+    }
   }
   if (num_channels == 0) num_channels = format->num_channels;
   size_t row_bits;
