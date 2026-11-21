@@ -267,6 +267,8 @@ Status FrameDecoder::InitFrameOutput() {
   num_required_groups_ = frame_dim_.num_groups;
   num_required_sections_ = toc_.size();
   fallback_reason_ = RegionFallbackReason::kNoRegion;
+  scale_mode_ = ScaleDecodeMode::kNone;
+  required_passes_ = frame_header_.passes.num_passes;
   return true;
 }
 
@@ -498,8 +500,13 @@ Status FrameDecoder::ProcessACGroup(size_t ac_group_id,
               ac_group_id, gx, gy, group_dim,
               decoded_passes_per_ac_group_[ac_group_id], num_passes);
 
-  RenderPipelineInput render_pipeline_input =
-      dec_state_->render_pipeline->GetInputBuffers(ac_group_id, thread);
+  const bool skip_pipeline_input =
+      (scale_mode_ == ScaleDecodeMode::kModularSqueezeNative);
+  RenderPipelineInput render_pipeline_input;
+  if (!skip_pipeline_input) {
+    render_pipeline_input =
+        dec_state_->render_pipeline->GetInputBuffers(ac_group_id, thread);
+  }
 
   bool should_run_pipeline = true;
 
@@ -519,6 +526,8 @@ Status FrameDecoder::ProcessACGroup(size_t ac_group_id,
   size_t pass0 = decoded_passes_per_ac_group_[ac_group_id];
   size_t pass1 =
       force_draw ? frame_header_.passes.num_passes : pass0 + num_passes;
+  RenderPipelineInput* rpi_ptr =
+      skip_pipeline_input ? nullptr : &render_pipeline_input;
   for (size_t i = pass0; i < pass1; ++i) {
     int minShift;
     int maxShift;
@@ -533,13 +542,13 @@ Status FrameDecoder::ProcessACGroup(size_t ac_group_id,
       JXL_RETURN_IF_ERROR(modular_frame_decoder_.DecodeGroup(
           frame_header_, mrect, br[i - pass0], minShift, maxShift,
           ModularStreamId::ModularAC(ac_group_id, i),
-          /*zerofill=*/false, dec_state_, &render_pipeline_input,
+          /*zerofill=*/false, dec_state_, rpi_ptr,
           /*allow_truncated=*/false, &modular_pass_ready));
     } else {
       JXL_RETURN_IF_ERROR(modular_frame_decoder_.DecodeGroup(
           frame_header_, mrect, nullptr, minShift, maxShift,
           ModularStreamId::ModularAC(ac_group_id, i), /*zerofill=*/true,
-          dec_state_, &render_pipeline_input,
+          dec_state_, rpi_ptr,
           /*allow_truncated=*/false, &modular_pass_ready));
     }
     if (modular_pass_ready) modular_ready = true;
@@ -551,7 +560,8 @@ Status FrameDecoder::ProcessACGroup(size_t ac_group_id,
                       thread);
   }
 
-  if (!modular_frame_decoder_.UsesFullImage() && !decoded_->IsJPEG()) {
+  if (!skip_pipeline_input && !modular_frame_decoder_.UsesFullImage() &&
+      !decoded_->IsJPEG()) {
     if (should_run_pipeline && modular_ready) {
       JXL_RETURN_IF_ERROR(render_pipeline_input.Done());
     } else if (force_draw) {
@@ -662,6 +672,17 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
   }
 
   if (!HasDcGroupToDecode() && !finalized_dc_) {
+    PlanRequiredGroups(/*after_dc_global=*/true);
+    if (scale_policy_ == ScalePolicy::kRequireFastNative &&
+        output_downsampling_ > 1 && !IsFastNativeScaleAvailable()) {
+      return JXL_FAILURE(
+          "Fast native downscaling is not available for this frame");
+    }
+    dec_state_->output_downsampling = output_downsampling_;
+    dec_state_->native_scaled_pipeline =
+        (scale_mode_ == ScaleDecodeMode::kNativeVarDCTDC ||
+         scale_mode_ == ScaleDecodeMode::kModularSqueezeNative);
+
     PassesDecoderState::PipelineOptions pipeline_options;
     pipeline_options.use_slow_render_pipeline = use_slow_rendering_pipeline_;
     pipeline_options.coalescing = coalescing_;
@@ -679,15 +700,34 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
     }
   }
 
-  if (finalized_dc_ && ac_global_sec != num && !decoded_ac_global_) {
+  const bool skip_all_ac =
+      finalized_dc_ &&
+      (scale_mode_ == ScaleDecodeMode::kNativeVarDCTDC ||
+       (scale_mode_ == ScaleDecodeMode::kModularSqueezeNative &&
+        required_passes_ == 0));
+
+  if (!skip_all_ac && finalized_dc_ && ac_global_sec != num &&
+      !decoded_ac_global_) {
     JXL_RETURN_IF_ERROR(ProcessACGlobal(sections[ac_global_sec].br));
     section_status[ac_global_sec] = SectionStatus::kDone;
   }
 
-  if (can_skip_ac_groups_) {
-    for (size_t i = 0; i < ac_group_sec.size(); i++) {
-      if (!required_ac_groups_[i]) {
-        desired_num_ac_passes[i] = 0;
+  if (skip_all_ac) {
+    std::fill(desired_num_ac_passes.begin(), desired_num_ac_passes.end(), 0);
+  } else {
+    if (can_skip_ac_groups_) {
+      for (size_t i = 0; i < ac_group_sec.size(); i++) {
+        if (!required_ac_groups_[i]) {
+          desired_num_ac_passes[i] = 0;
+        }
+      }
+    }
+    if (required_passes_ < frame_header_.passes.num_passes) {
+      for (size_t i = 0; i < ac_group_sec.size(); i++) {
+        size_t rem = (decoded_passes_per_ac_group_[i] < required_passes_)
+                         ? (required_passes_ - decoded_passes_per_ac_group_[i])
+                         : 0;
+        desired_num_ac_passes[i] = std::min(desired_num_ac_passes[i], rem);
       }
     }
   }
@@ -702,11 +742,13 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
     }
   }
 
-  if (decoded_ac_global_) {
+  if (!skip_all_ac && decoded_ac_global_) {
     // Mark all the AC groups that we received as not complete yet.
-    for (size_t i = 0; i < ac_group_sec.size(); i++) {
-      if (desired_num_ac_passes[i] != 0) {
-        dec_state_->render_pipeline->ClearDone(i);
+    if (scale_mode_ != ScaleDecodeMode::kModularSqueezeNative) {
+      for (size_t i = 0; i < ac_group_sec.size(); i++) {
+        if (desired_num_ac_passes[i] != 0) {
+          dec_state_->render_pipeline->ClearDone(i);
+        }
       }
     }
 
@@ -729,9 +771,13 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
         JXL_ENSURE(ac_group_sec[g][first_pass + i] != num);
         readers[i] = sections[ac_group_sec[g][first_pass + i]].br;
       }
+      const bool force_draw =
+          (scale_mode_ == ScaleDecodeMode::kProgressivePassSkip &&
+           required_passes_ < frame_header_.passes.num_passes &&
+           first_pass + desired_num_ac_passes[g] >= required_passes_);
       JXL_RETURN_IF_ERROR(ProcessACGroup(
           g, readers, desired_num_ac_passes[g], GetStorageLocation(thread, g),
-          /*force_draw=*/false, /*dc_only=*/false));
+          force_draw, /*dc_only=*/false));
       for (size_t i = 0; i < desired_num_ac_passes[g]; i++) {
         section_status[ac_group_sec[g][first_pass + i]] = SectionStatus::kDone;
       }
@@ -814,7 +860,143 @@ void FrameDecoder::PlanRequiredGroups(bool after_dc_global) {
   can_skip_ac_groups_ = false;
   required_ac_groups_.assign(frame_dim_.num_groups, 1);
   num_required_groups_ = frame_dim_.num_groups;
+  required_passes_ = frame_header_.passes.num_passes;
+  scale_mode_ = ScaleDecodeMode::kNone;
   num_required_sections_ = toc_.size();
+
+  bool has_blending = frame_header_.blending_info.mode != BlendMode::kReplace ||
+                      frame_header_.custom_size_or_origin;
+  for (const auto& blending_info_ec :
+       frame_header_.extra_channel_blending_info) {
+    if (blending_info_ec.mode != BlendMode::kReplace) has_blending = true;
+  }
+
+  const bool basic_eligible =
+      !frame_header_.CanBeReferenced() && frame_header_.dc_level == 0 &&
+      !use_slow_rendering_pipeline_ && !(decoded_ && decoded_->IsJPEG());
+
+  if (output_downsampling_ > 1) {
+    if (scale_policy_ == ScalePolicy::kReferenceResample || !basic_eligible) {
+      scale_mode_ = ScaleDecodeMode::kStreamingDownsampleFallback;
+    } else {
+      // Path A: Native VarDCT 1:8 DC.
+      const bool can_native_vardct_dc =
+          output_downsampling_ == 8 &&
+          frame_header_.encoding == FrameEncoding::kVarDCT &&
+          frame_header_.upsampling == 1 &&
+          frame_header_.chroma_subsampling.Is444() &&
+          !(frame_header_.flags &
+            (FrameHeader::kPatches | FrameHeader::kSplines |
+             FrameHeader::kNoise | FrameHeader::kUseDcFrame)) &&
+          !has_blending &&
+          frame_header_.nonserialized_metadata->m.num_extra_channels == 0;
+
+      // Path B: Native Modular Squeeze partial inverse.
+      bool ec_compatible = true;
+      for (size_t ec = 0; ec < frame_header_.extra_channel_upsampling.size();
+           ++ec) {
+        if (frame_header_.extra_channel_upsampling[ec] != 1) {
+          ec_compatible = false;
+        }
+      }
+      for (const auto& eci :
+           frame_header_.nonserialized_metadata->m.extra_channel_info) {
+        if (eci.dim_shift != 0) ec_compatible = false;
+      }
+      const bool can_modular_squeeze_header =
+          frame_header_.encoding == FrameEncoding::kModular &&
+          frame_header_.upsampling == 1 && ec_compatible &&
+          !(frame_header_.flags & (FrameHeader::kPatches |
+                                   FrameHeader::kSplines | FrameHeader::kNoise)) &&
+          !has_blending;
+      const bool can_modular_squeeze =
+          can_modular_squeeze_header &&
+          (after_dc_global
+               ? modular_frame_decoder_.HasSqueezeForDownsampling(
+                     output_downsampling_)
+               : (frame_header_.passes.num_passes > 1 &&
+                  frame_header_.passes.num_downsample > 0));
+
+      // Path C: Progressive VarDCT pass skipping.
+      size_t prog_required_passes = frame_header_.passes.num_passes;
+      if (frame_header_.encoding == FrameEncoding::kVarDCT &&
+          frame_header_.passes.num_passes > 1) {
+        for (size_t k = 1; k < frame_header_.passes.num_passes; ++k) {
+          if (frame_header_.passes.GetDownsamplingTargetForCompletedPasses(k) <=
+              output_downsampling_) {
+            prog_required_passes = k;
+            break;
+          }
+        }
+      }
+
+      if (can_native_vardct_dc) {
+        scale_mode_ = ScaleDecodeMode::kNativeVarDCTDC;
+        required_passes_ = 0;
+      } else if (can_modular_squeeze) {
+        scale_mode_ = ScaleDecodeMode::kModularSqueezeNative;
+        const int target_shift =
+            static_cast<int>(CeilLog2Nonzero(output_downsampling_));
+        size_t req_p = 0;
+        for (size_t p = 0; p < frame_header_.passes.num_passes; ++p) {
+          int minShift = 0;
+          int maxShift = 0;
+          frame_header_.passes.GetDownsamplingBracket(p, minShift, maxShift);
+          if (maxShift >= target_shift) {
+            req_p = p + 1;
+          }
+        }
+        required_passes_ = req_p;
+      } else if (prog_required_passes < frame_header_.passes.num_passes) {
+        scale_mode_ = ScaleDecodeMode::kProgressivePassSkip;
+        required_passes_ = prog_required_passes;
+      } else {
+        scale_mode_ = ScaleDecodeMode::kStreamingDownsampleFallback;
+      }
+    }
+  }
+
+  // Paths that skip all AC sections (Path A VarDCT 1:8 DC, Path B 1:8 Squeeze).
+  if (scale_mode_ == ScaleDecodeMode::kNativeVarDCTDC ||
+      (scale_mode_ == ScaleDecodeMode::kModularSqueezeNative &&
+       required_passes_ == 0)) {
+    can_skip_ac_groups_ = true;
+    required_ac_groups_.assign(frame_dim_.num_groups, 0);
+    num_required_groups_ = 0;
+    num_required_sections_ =
+        (toc_.size() <= 1) ? toc_.size() : (1 + frame_dim_.num_dc_groups);
+    fallback_reason_ =
+        (output_region_.xsize() > 0 && output_region_.ysize() > 0)
+            ? RegionFallbackReason::kNone
+            : RegionFallbackReason::kNoRegion;
+    return;
+  }
+
+  // Path B with required_passes_ > 0: Modular Squeeze uses full_image, so all
+  // spatial groups are needed for required_passes_ while fine passes are
+  // skipped.
+  if (scale_mode_ == ScaleDecodeMode::kModularSqueezeNative) {
+    can_skip_ac_groups_ = false;
+    required_ac_groups_.assign(frame_dim_.num_groups, 1);
+    num_required_groups_ = frame_dim_.num_groups;
+    num_required_sections_ =
+        (toc_.size() <= 1)
+            ? toc_.size()
+            : (2 + frame_dim_.num_dc_groups +
+               frame_dim_.num_groups * required_passes_);
+    fallback_reason_ =
+        (output_region_.xsize() > 0 && output_region_.ysize() > 0)
+            ? RegionFallbackReason::kModularGlobalTransforms
+            : RegionFallbackReason::kNoRegion;
+    return;
+  }
+
+  const size_t full_sections_for_req_passes =
+      (toc_.size() <= 1)
+          ? toc_.size()
+          : (2 + frame_dim_.num_dc_groups +
+             frame_dim_.num_groups * required_passes_);
+  num_required_sections_ = full_sections_for_req_passes;
 
   if (output_region_.xsize() == 0 || output_region_.ysize() == 0) {
     fallback_reason_ = RegionFallbackReason::kNoRegion;
@@ -860,19 +1042,25 @@ void FrameDecoder::PlanRequiredGroups(bool after_dc_global) {
     return;
   }
 
-  const Rect unoriented_region = PassesDecoderState::ComputeUnorientedRegion(
-      output_region_, unoriented_w, unoriented_h, undo_orientation);
-  if (unoriented_region.xsize() == 0 || unoriented_region.ysize() == 0) {
+  const size_t eff_ds = output_downsampling_ > 1 ? output_downsampling_ : 1;
+  const size_t scaled_unoriented_w = DivCeil(unoriented_w, eff_ds);
+  const size_t scaled_unoriented_h = DivCeil(unoriented_h, eff_ds);
+  const Rect unoriented_scaled = PassesDecoderState::ComputeUnorientedRegion(
+      output_region_, scaled_unoriented_w, scaled_unoriented_h,
+      undo_orientation);
+  if (unoriented_scaled.xsize() == 0 || unoriented_scaled.ysize() == 0) {
     fallback_reason_ = RegionFallbackReason::kNoRegion;
     return;
   }
-
-  bool has_blending = frame_header_.blending_info.mode != BlendMode::kReplace ||
-                      frame_header_.custom_size_or_origin;
-  for (const auto& blending_info_ec :
-       frame_header_.extra_channel_blending_info) {
-    if (blending_info_ec.mode != BlendMode::kReplace) has_blending = true;
+  Rect unoriented_region = unoriented_scaled;
+  if (eff_ds > 1) {
+    const size_t rx0 = unoriented_scaled.x0() * eff_ds;
+    const size_t ry0 = unoriented_scaled.y0() * eff_ds;
+    const size_t rx1 = std::min(unoriented_w, unoriented_scaled.x1() * eff_ds);
+    const size_t ry1 = std::min(unoriented_h, unoriented_scaled.y1() * eff_ds);
+    unoriented_region = Rect(rx0, ry0, rx1 - rx0, ry1 - ry0);
   }
+
   const bool apply_origin = coalescing_ && has_blending;
 
   RectT<ptrdiff_t> region(unoriented_region.x0(), unoriented_region.y0(),
@@ -940,8 +1128,7 @@ void FrameDecoder::PlanRequiredGroups(bool after_dc_global) {
 
   num_required_groups_ = num_required_groups;
   num_required_sections_ =
-      2 + frame_dim_.num_dc_groups +
-      num_required_groups * frame_header_.passes.num_passes;
+      2 + frame_dim_.num_dc_groups + num_required_groups * required_passes_;
 }
 
 void FrameDecoder::GetRequiredCodestreamRanges(
@@ -975,6 +1162,11 @@ FrameDecoder::RegionDecodeStats FrameDecoder::GetRegionDecodeStats() const {
   stats.total_sections = toc_.size();
   stats.required_sections = num_required_sections_;
   stats.total_frame_payload_bytes = section_sizes_sum_;
+  stats.downsampling = output_downsampling_;
+  stats.scale_policy = scale_policy_;
+  stats.scale_mode = scale_mode_;
+  stats.total_passes = frame_header_.passes.num_passes;
+  stats.required_passes = required_passes_;
   return stats;
 }
 
@@ -1057,11 +1249,16 @@ int FrameDecoder::SavedAs(const FrameHeader& header) {
 
 bool FrameDecoder::HasEverything() const {
   if (!decoded_dc_global_) return false;
-  if (!decoded_ac_global_) return false;
   if (HasDcGroupToDecode()) return false;
+  if (scale_mode_ == ScaleDecodeMode::kNativeVarDCTDC ||
+      (scale_mode_ == ScaleDecodeMode::kModularSqueezeNative &&
+       required_passes_ == 0)) {
+    return true;
+  }
+  if (!decoded_ac_global_) return false;
   for (size_t g = 0; g < decoded_passes_per_ac_group_.size(); ++g) {
     if (can_skip_ac_groups_ && !required_ac_groups_[g]) continue;
-    if (decoded_passes_per_ac_group_[g] < frame_header_.passes.num_passes) {
+    if (decoded_passes_per_ac_group_[g] < required_passes_) {
       return false;
     }
   }
@@ -1117,14 +1314,53 @@ Status FrameDecoder::FinalizeFrame() {
     return true;
   }
 
-  // undo global modular transforms and copy int pixel buffers to float ones
-  JXL_RETURN_IF_ERROR(
-      modular_frame_decoder_.FinalizeDecoding(frame_header_, dec_state_, pool_,
-                                              /*inplace=*/true));
+  if (scale_mode_ == ScaleDecodeMode::kNativeVarDCTDC) {
+    const size_t dc_w = DivCeil(frame_dim_.xsize_upsampled, 8);
+    const size_t dc_h = DivCeil(frame_dim_.ysize_upsampled, 8);
+    FrameDimensions scaled_dim;
+    scaled_dim.Set(dc_w, dc_h, frame_header_.group_size_shift, 0, 0, false, 1);
+    const Image3F& dc = *dec_state_->shared->dc;
+    JXL_ENSURE(dc.xsize() >= dc_w && dc.ysize() >= dc_h);
+    for (size_t g = 0; g < scaled_dim.num_groups; ++g) {
+      dec_state_->render_pipeline->ClearDone(g);
+    }
+    const auto init = [&](size_t num_threads) -> Status {
+      return dec_state_->render_pipeline->PrepareForThreads(
+          num_threads, /*use_group_ids=*/false);
+    };
+    const auto process_group = [&](const uint32_t g,
+                                   size_t thread_id) -> Status {
+      RenderPipelineInput input =
+          dec_state_->render_pipeline->GetInputBuffers(g, thread_id);
+      const Rect gr = scaled_dim.GroupRect(g);
+      for (size_t c = 0; c < 3; ++c) {
+        const auto& buf = input.GetBuffer(c);
+        const Rect& r = buf.second;
+        JXL_ENSURE(r.xsize() == gr.xsize() && r.ysize() == gr.ysize());
+        for (size_t y = 0; y < r.ysize(); ++y) {
+          memcpy(r.Row(buf.first, y),
+                 dc.ConstPlaneRow(c, gr.y0() + y) + gr.x0(),
+                 r.xsize() * sizeof(float));
+        }
+      }
+      return input.Done();
+    };
+    JXL_RETURN_IF_ERROR(RunOnPool(pool_, 0, scaled_dim.num_groups, init,
+                                  process_group, "VarDCTDCToPipeline"));
+  } else if (scale_mode_ == ScaleDecodeMode::kModularSqueezeNative) {
+    JXL_RETURN_IF_ERROR(modular_frame_decoder_.FinalizeDecoding(
+        frame_header_, dec_state_, pool_, /*inplace=*/true,
+        /*downsampling=*/output_downsampling_));
+  } else {
+    // undo global modular transforms and copy int pixel buffers to float ones
+    JXL_RETURN_IF_ERROR(modular_frame_decoder_.FinalizeDecoding(
+        frame_header_, dec_state_, pool_, /*inplace=*/true));
+  }
 
   if (dec_state_->render_pipeline) {
     JXL_RETURN_IF_ERROR(
         dec_state_->render_pipeline->RenderOutOfFramePadding(0));
+    JXL_RETURN_IF_ERROR(dec_state_->render_pipeline->FinalizeOutput());
   }
 
   if (frame_header_.CanBeReferenced()) {

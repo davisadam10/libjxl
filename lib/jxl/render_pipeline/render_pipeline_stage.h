@@ -164,6 +164,10 @@ class RenderPipelineStage {
   virtual void ProcessPaddingRow(const RowInfo& output_rows, size_t xsize,
                                  size_t xpos, size_t ypos) const {}
 
+  // Optional finalization hook called once all frame groups have been
+  // processed (used e.g. to flush streaming downsampling accumulators).
+  virtual Status FinalizeOutput() { return true; }
+
   virtual const char* GetName() const = 0;
 
   Settings settings_;

@@ -123,7 +123,8 @@ class ModularFrameDecoder {
   // steps)
   Status FinalizeDecoding(const FrameHeader& frame_header,
                           PassesDecoderState* dec_state, jxl::ThreadPool* pool,
-                          bool inplace);
+                          bool inplace, size_t downsampling = 1);
+  bool HasSqueezeForDownsampling(size_t downsampling) const;
   bool have_dc() const { return have_something; }
   void MaybeDropFullImage();
   bool UsesFullImage() const { return use_full_image; }
