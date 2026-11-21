@@ -109,8 +109,48 @@ struct PassesDecoderState {
   // Image dimensions before applying undo_orientation.
   size_t width;
   size_t height;
+  // Optional target output region in oriented output coordinates.
+  // Empty (xsize == 0 || ysize == 0) means full image.
+  Rect output_region;
   ImageOutput main_output;
   std::vector<ImageOutput> extra_output;
+
+  static Rect ComputeUnorientedRegion(const Rect& out_region,
+                                      size_t unoriented_w, size_t unoriented_h,
+                                      Orientation undo_orientation) {
+    if (out_region.xsize() == 0 || out_region.ysize() == 0) {
+      return Rect();
+    }
+    const bool flip_x = (undo_orientation == Orientation::kFlipHorizontal ||
+                         undo_orientation == Orientation::kRotate180 ||
+                         undo_orientation == Orientation::kRotate270 ||
+                         undo_orientation == Orientation::kAntiTranspose);
+    const bool flip_y = (undo_orientation == Orientation::kFlipVertical ||
+                         undo_orientation == Orientation::kRotate180 ||
+                         undo_orientation == Orientation::kRotate90 ||
+                         undo_orientation == Orientation::kAntiTranspose);
+    const bool transpose = (undo_orientation == Orientation::kTranspose ||
+                            undo_orientation == Orientation::kRotate90 ||
+                            undo_orientation == Orientation::kRotate270 ||
+                            undo_orientation == Orientation::kAntiTranspose);
+    size_t x0 = transpose ? out_region.y0() : out_region.x0();
+    size_t x1 = transpose ? out_region.y1() : out_region.x1();
+    size_t y0 = transpose ? out_region.x0() : out_region.y0();
+    size_t y1 = transpose ? out_region.x1() : out_region.y1();
+    if (flip_x) {
+      size_t nx0 = unoriented_w - x1;
+      size_t nx1 = unoriented_w - x0;
+      x0 = nx0;
+      x1 = nx1;
+    }
+    if (flip_y) {
+      size_t ny0 = unoriented_h - y1;
+      size_t ny1 = unoriented_h - y0;
+      y0 = ny0;
+      y1 = ny1;
+    }
+    return Rect(x0, y0, x1 - x0, y1 - y0);
+  }
 
   // Whether to use int16 float-XYB-to-uint8-srgb conversion.
   bool fast_xyb_srgb8_conversion;
@@ -161,6 +201,7 @@ struct PassesDecoderState {
     x_dm_multiplier = std::pow(1 / (1.25f), frame_header.x_qm_scale - 2.0f);
     b_dm_multiplier = std::pow(1 / (1.25f), frame_header.b_qm_scale - 2.0f);
 
+    output_region = Rect();
     main_output.callback = PixelCallback();
     main_output.buffer = nullptr;
     extra_output.clear();

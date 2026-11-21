@@ -7,6 +7,7 @@
 #include <jxl/codestream_header.h>
 #include <jxl/color_encoding.h>
 #include <jxl/decode.h>
+#include <jxl/decode_roi_experimental.h>
 #include <jxl/jxl_export.h>
 #include <jxl/memory_manager.h>
 #include <jxl/parallel_runner.h>
@@ -428,6 +429,28 @@ struct JxlDecoder {
   JxlPixelFormat image_out_format;
   JxlBitDepth image_out_bit_depth;
 
+  bool has_decode_region;
+  size_t decode_region_x0;
+  size_t decode_region_y0;
+  size_t decode_region_width;
+  size_t decode_region_height;
+
+  // Exact file offset where the current frame's section payload (after TOC)
+  // begins, valid when the frame's codestream bytes are contiguous in the file.
+  uint64_t frame_data_file_offset;
+  bool frame_data_file_offset_valid;
+
+  // Bounded sparse / offset-tagged input assembly keyed by physical TOC index.
+  struct SparseSectionData {
+    std::vector<uint8_t> data;
+    std::vector<std::pair<size_t, size_t>> filled_intervals;
+    bool complete = false;
+  };
+  bool sparse_mode_active;
+  std::map<size_t, SparseSectionData> sparse_sections;
+  size_t sparse_bytes_buffered;
+  JxlExperimentalRegionDecodeStats last_region_stats;
+
   // For extra channels. Empty if no extra channels are requested, and they are
   // reset each frame
   std::vector<ExtraChannelOutput> extra_channel_output;
@@ -590,6 +613,23 @@ struct JxlDecoder {
           std::min<size_t>(avail_codestream, box_contents_end - file_pos);
     }
     return avail_codestream;
+  }
+
+  uint64_t CurrentCodestreamFileOffset() const {
+    if (codestream_copy.empty()) {
+      return static_cast<uint64_t>(file_pos) +
+             static_cast<uint64_t>(codestream_pos);
+    }
+    const size_t consumed_into_copy =
+        codestream_copy.size() - codestream_unconsumed;
+    return static_cast<uint64_t>(file_pos - consumed_into_copy) +
+           static_cast<uint64_t>(codestream_pos);
+  }
+
+  void ClearSparseInput() {
+    sparse_mode_active = false;
+    sparse_sections.clear();
+    sparse_bytes_buffered = 0;
   }
 
   void AdvanceCodestream(size_t size) {
@@ -790,6 +830,11 @@ void RewindDecodingState(JxlDecoder* dec) {
 
   dec->frame_stage = FrameStage::kHeader;
   dec->remaining_frame_size = 0;
+  dec->frame_data_file_offset = 0;
+  dec->frame_data_file_offset_valid = false;
+  dec->ClearSparseInput();
+  memset(&dec->last_region_stats, 0, sizeof(dec->last_region_stats));
+  dec->last_region_stats.fallback_reason = JXL_EXP_FALLBACK_NO_REGION;
   dec->is_last_of_still = false;
   dec->is_last_total = false;
   dec->skip_frames = 0;
@@ -808,6 +853,11 @@ void JxlDecoderReset(JxlDecoder* dec) {
   dec->unpremul_alpha = false;
   dec->render_spotcolors = true;
   dec->coalescing = true;
+  dec->has_decode_region = false;
+  dec->decode_region_x0 = 0;
+  dec->decode_region_y0 = 0;
+  dec->decode_region_width = 0;
+  dec->decode_region_height = 0;
   dec->desired_intensity_target = 0;
   dec->orig_events_wanted = 0;
   dec->events_wanted = 0;
@@ -960,6 +1010,259 @@ JxlDecoderStatus JxlDecoderSetCoalescing(JxlDecoder* dec, JXL_BOOL coalescing) {
 }
 
 namespace {
+bool ValidateDecodeRegionBounds(const JxlDecoder* dec, size_t x0, size_t y0,
+                                size_t width, size_t height) {
+  const size_t img_w = dec->metadata.oriented_xsize(dec->keep_orientation);
+  const size_t img_h = dec->metadata.oriented_ysize(dec->keep_orientation);
+  size_t x1 = 0;
+  size_t y1 = 0;
+  if (!jxl::SafeAdd(x0, width, x1) || !jxl::SafeAdd(y0, height, y1)) {
+    return false;
+  }
+  return x1 <= img_w && y1 <= img_h;
+}
+
+JxlExperimentalRegionFallbackReason ToExperimentalFallbackReason(
+    jxl::FrameDecoder::RegionFallbackReason r) {
+  switch (r) {
+    case jxl::FrameDecoder::RegionFallbackReason::kNone:
+      return JXL_EXP_FALLBACK_NONE;
+    case jxl::FrameDecoder::RegionFallbackReason::kNoRegion:
+      return JXL_EXP_FALLBACK_NO_REGION;
+    case jxl::FrameDecoder::RegionFallbackReason::kSingleSection:
+      return JXL_EXP_FALLBACK_SINGLE_SECTION;
+    case jxl::FrameDecoder::RegionFallbackReason::kReferenceableFrame:
+      return JXL_EXP_FALLBACK_REFERENCEABLE_FRAME;
+    case jxl::FrameDecoder::RegionFallbackReason::kModularGlobalTransforms:
+      return JXL_EXP_FALLBACK_MODULAR_GLOBAL_TRANSFORMS;
+    case jxl::FrameDecoder::RegionFallbackReason::kSimpleRenderPipeline:
+      return JXL_EXP_FALLBACK_SIMPLE_RENDER_PIPELINE;
+    case jxl::FrameDecoder::RegionFallbackReason::kJpegReconstruction:
+      return JXL_EXP_FALLBACK_JPEG_RECONSTRUCTION;
+  }
+  return JXL_EXP_FALLBACK_NO_REGION;
+}
+
+void ApplyDecodeRegionToFrameDecoder(JxlDecoder* dec) {
+  if (!dec->frame_dec) return;
+  if (dec->has_decode_region && !dec->preview_frame) {
+    const size_t xsize = dec->metadata.oriented_xsize(dec->keep_orientation);
+    const size_t ysize = dec->metadata.oriented_ysize(dec->keep_orientation);
+    const jxl::Orientation undo_orient =
+        dec->keep_orientation ? jxl::Orientation::kIdentity
+                              : dec->metadata.m.GetOrientation();
+    dec->frame_dec->SetDecodeRegion(
+        jxl::Rect(dec->decode_region_x0, dec->decode_region_y0,
+                  dec->decode_region_width, dec->decode_region_height),
+        xsize, ysize, undo_orient);
+  } else {
+    dec->frame_dec->SetDecodeRegion(jxl::Rect());
+  }
+}
+
+void PopulateRegionStats(const JxlDecoder* dec,
+                         JxlExperimentalRegionDecodeStats* stats) {
+  memset(stats, 0, sizeof(*stats));
+  if (!dec->frame_dec) {
+    *stats = dec->last_region_stats;
+    return;
+  }
+  const auto fd_stats = dec->frame_dec->GetRegionDecodeStats();
+  stats->fallback_reason = ToExperimentalFallbackReason(fd_stats.fallback_reason);
+  if (stats->fallback_reason == JXL_EXP_FALLBACK_NONE &&
+      !dec->frame_data_file_offset_valid) {
+    stats->fallback_reason = JXL_EXP_FALLBACK_MULTI_JXLP_UNKNOWN_BOUNDARIES;
+  }
+  stats->total_groups = fd_stats.total_groups;
+  stats->required_groups = fd_stats.required_groups;
+  stats->skipped_groups = fd_stats.skipped_groups;
+  stats->total_sections = fd_stats.total_sections;
+  stats->required_sections = fd_stats.required_sections;
+  stats->total_frame_payload_bytes = fd_stats.total_frame_payload_bytes;
+
+  std::vector<jxl::FrameDecoder::ByteRange> cs_ranges;
+  dec->frame_dec->GetRequiredCodestreamRanges(/*coalesce_adjacent=*/true,
+                                              &cs_ranges);
+  stats->planned_range_count = cs_ranges.size();
+  uint64_t total_planned = 0;
+  for (const auto& r : cs_ranges) {
+    total_planned += r.length;
+  }
+  stats->planned_bytes_to_read = total_planned;
+}
+
+void MergeInterval(std::vector<std::pair<size_t, size_t>>* intervals,
+                   size_t start, size_t end) {
+  if (start >= end) return;
+  intervals->emplace_back(start, end);
+  std::sort(intervals->begin(), intervals->end());
+  size_t write = 0;
+  for (size_t i = 1; i < intervals->size(); ++i) {
+    if ((*intervals)[i].first <= (*intervals)[write].second) {
+      (*intervals)[write].second =
+          std::max((*intervals)[write].second, (*intervals)[i].second);
+    } else {
+      ++write;
+      (*intervals)[write] = (*intervals)[i];
+    }
+  }
+  intervals->resize(write + 1);
+}
+}  // namespace
+
+JxlDecoderStatus JxlDecoderExperimentalSetOutputRegion(JxlDecoder* dec,
+                                                       uint32_t x, uint32_t y,
+                                                       uint32_t width,
+                                                       uint32_t height) {
+  if (!dec) {
+    return JXL_API_ERROR("Invalid decoder");
+  }
+  if (dec->image_out_buffer_set) {
+    return JXL_API_ERROR(
+        "Must set output region before setting image output buffer");
+  }
+  if (width == 0 && height == 0) {
+    dec->has_decode_region = false;
+    dec->decode_region_x0 = 0;
+    dec->decode_region_y0 = 0;
+    dec->decode_region_width = 0;
+    dec->decode_region_height = 0;
+    ApplyDecodeRegionToFrameDecoder(dec);
+    return JXL_DEC_SUCCESS;
+  }
+  if (width == 0 || height == 0) {
+    return JXL_API_ERROR("Output region width and height must be non-zero");
+  }
+  size_t x1 = 0;
+  size_t y1 = 0;
+  if (!jxl::SafeAdd<size_t>(x, width, x1) ||
+      !jxl::SafeAdd<size_t>(y, height, y1)) {
+    return JXL_API_ERROR("Output region coordinates overflow");
+  }
+  if (dec->got_basic_info &&
+      !ValidateDecodeRegionBounds(dec, x, y, width, height)) {
+    return JXL_API_ERROR("Output region out of image bounds");
+  }
+  dec->has_decode_region = true;
+  dec->decode_region_x0 = x;
+  dec->decode_region_y0 = y;
+  dec->decode_region_width = width;
+  dec->decode_region_height = height;
+  ApplyDecodeRegionToFrameDecoder(dec);
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus JxlDecoderExperimentalGetRequiredInputRanges(
+    const JxlDecoder* dec, JxlExperimentalInputRange* ranges,
+    size_t* range_count) {
+  if (!dec || !range_count) {
+    return JXL_API_ERROR("Invalid arguments");
+  }
+  if (!dec->frame_dec || dec->frame_stage == FrameStage::kHeader) {
+    return JXL_API_ERROR("Frame header and TOC not yet parsed");
+  }
+  if (!dec->frame_data_file_offset_valid) {
+    return JXL_API_ERROR(
+        "Cannot map TOC sections to file offsets for this container layout");
+  }
+  std::vector<jxl::FrameDecoder::ByteRange> cs_ranges;
+  dec->frame_dec->GetRequiredCodestreamRanges(/*coalesce_adjacent=*/true,
+                                              &cs_ranges);
+  if (ranges == nullptr) {
+    *range_count = cs_ranges.size();
+    return JXL_DEC_SUCCESS;
+  }
+  if (*range_count < cs_ranges.size()) {
+    *range_count = cs_ranges.size();
+    return JXL_API_ERROR("Output range buffer too small");
+  }
+  for (size_t i = 0; i < cs_ranges.size(); ++i) {
+    if (dec->frame_data_file_offset + cs_ranges[i].offset <
+        dec->frame_data_file_offset) {
+      return JXL_API_ERROR("File offset overflow");
+    }
+    ranges[i].offset = dec->frame_data_file_offset + cs_ranges[i].offset;
+    ranges[i].length = cs_ranges[i].length;
+  }
+  *range_count = cs_ranges.size();
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus JxlDecoderExperimentalSetInputAtOffset(JxlDecoder* dec,
+                                                        const uint8_t* data,
+                                                        size_t size,
+                                                        uint64_t offset) {
+  if (!dec || (size > 0 && !data)) {
+    return JXL_API_ERROR("Invalid arguments");
+  }
+  if (!dec->frame_dec || dec->frame_stage == FrameStage::kHeader) {
+    return JXL_API_ERROR("Frame header and TOC not yet parsed");
+  }
+  if (!dec->frame_data_file_offset_valid) {
+    return JXL_API_ERROR(
+        "Sparse offset input not supported for this container layout");
+  }
+  if (offset + size < offset) {
+    return JXL_API_ERROR("Sparse input offset + size overflow");
+  }
+  const auto& toc = dec->frame_dec->Toc();
+  const auto& offsets = dec->frame_dec->SectionCodestreamOffsets();
+  if (dec->section_processed.size() != toc.size()) {
+    dec->section_processed.assign(toc.size(), 0);
+  }
+  dec->sparse_mode_active = true;
+  if (size == 0) return JXL_DEC_SUCCESS;
+
+  const uint64_t in_start = offset;
+  const uint64_t in_end = offset + size;
+
+  for (size_t i = 0; i < toc.size(); ++i) {
+    if (dec->section_processed[i]) continue;
+    if (!dec->frame_dec->IsSectionRequiredPlanned(toc[i].id)) continue;
+    const size_t sec_size = toc[i].size;
+    if (sec_size == 0) continue;
+
+    const uint64_t sec_start = dec->frame_data_file_offset + offsets[i];
+    const uint64_t sec_end = sec_start + sec_size;
+    if (in_end <= sec_start || in_start >= sec_end) continue;
+
+    const uint64_t ov_start = std::max(in_start, sec_start);
+    const uint64_t ov_end = std::min(in_end, sec_end);
+    const size_t copy_len = static_cast<size_t>(ov_end - ov_start);
+    const size_t dst_off = static_cast<size_t>(ov_start - sec_start);
+    const size_t src_off = static_cast<size_t>(ov_start - in_start);
+
+    auto& entry = dec->sparse_sections[i];
+    if (entry.data.empty()) {
+      if (!dec->CanAddBuffer(dec->sparse_bytes_buffered + sec_size)) {
+        return JXL_API_ERROR("Sparse input buffer limit exceeded");
+      }
+      entry.data.resize(sec_size);
+      dec->sparse_bytes_buffered += sec_size;
+    }
+    if (!entry.complete) {
+      memcpy(entry.data.data() + dst_off, data + src_off, copy_len);
+      MergeInterval(&entry.filled_intervals, dst_off, dst_off + copy_len);
+      if (entry.filled_intervals.size() == 1 &&
+          entry.filled_intervals[0].first == 0 &&
+          entry.filled_intervals[0].second == sec_size) {
+        entry.complete = true;
+      }
+    }
+  }
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus JxlDecoderExperimentalGetRegionDecodeStats(
+    const JxlDecoder* dec, JxlExperimentalRegionDecodeStats* stats) {
+  if (!dec || !stats) {
+    return JXL_API_ERROR("Invalid arguments");
+  }
+  PopulateRegionStats(dec, stats);
+  return JXL_DEC_SUCCESS;
+}
+
+namespace {
 // helper function to get the dimensions of the current image buffer
 void GetCurrentDimensions(const JxlDecoder* dec, size_t& xsize, size_t& ysize) {
   if (dec->frame_header->nonserialized_is_preview) {
@@ -1054,6 +1357,14 @@ JxlDecoderStatus JxlDecoderReadBasicInfo(JxlDecoder* dec) {
     return JXL_INPUT_ERROR("image is too large");
   }
 
+  if (dec->has_decode_region &&
+      !ValidateDecodeRegionBounds(dec, dec->decode_region_x0,
+                                  dec->decode_region_y0,
+                                  dec->decode_region_width,
+                                  dec->decode_region_height)) {
+    return JXL_API_ERROR("Decode region out of image bounds");
+  }
+
   return JXL_DEC_SUCCESS;
 }
 
@@ -1133,9 +1444,100 @@ JxlDecoderStatus JxlDecoderReadAllHeaders(JxlDecoder* dec) {
 }
 
 JxlDecoderStatus JxlDecoderProcessSections(JxlDecoder* dec) {
+  const auto& toc = dec->frame_dec->Toc();
+  if (dec->sparse_mode_active) {
+    if (dec->section_processed.size() != toc.size()) {
+      dec->section_processed.assign(toc.size(), 0);
+    }
+    std::vector<jxl::FrameDecoder::SectionInfo> section_info;
+    std::vector<jxl::FrameDecoder::SectionStatus> section_status;
+    for (size_t i = 0; i < toc.size(); ++i) {
+      if (dec->section_processed[i]) continue;
+      const size_t id = toc[i].id;
+      const size_t size = toc[i].size;
+      if (!dec->frame_dec->IsSectionRequiredPlanned(id)) continue;
+      if (size == 0) {
+        static const uint8_t kEmptySection[16] = {};
+        auto* br = new jxl::BitReader(jxl::Bytes(kEmptySection + 8, 0));
+        section_info.emplace_back(jxl::FrameDecoder::SectionInfo{br, id, i});
+        section_status.emplace_back();
+        continue;
+      }
+      auto it = dec->sparse_sections.find(i);
+      if (it == dec->sparse_sections.end() || !it->second.complete) {
+        continue;
+      }
+      auto* br = new jxl::BitReader(
+          jxl::Bytes(it->second.data.data(), it->second.data.size()));
+      section_info.emplace_back(jxl::FrameDecoder::SectionInfo{br, id, i});
+      section_status.emplace_back();
+    }
+    if (section_info.empty()) {
+      return JXL_DEC_SUCCESS;
+    }
+    jxl::Status status = dec->frame_dec->ProcessSections(
+        section_info.data(), section_info.size(), section_status.data());
+    bool out_of_bounds = false;
+    bool has_error = false;
+    for (const auto& info : section_info) {
+      if (!info.br->AllReadsWithinBounds()) {
+        out_of_bounds = true;
+      }
+      if (!info.br->Close()) has_error = true;
+      delete info.br;
+    }
+    if (has_error) {
+      return JXL_INPUT_ERROR("internal: bit-reader failed to close");
+    }
+    if (out_of_bounds) {
+      return JXL_INPUT_ERROR("frame out of bounds");
+    }
+    if (!status) {
+      return JXL_INPUT_ERROR("frame processing failed");
+    }
+    for (size_t i = 0; i < section_status.size(); ++i) {
+      auto s_status = section_status[i];
+      if (s_status == jxl::FrameDecoder::kDone) {
+        size_t idx = section_info[i].index;
+        dec->section_processed[idx] = 1;
+        auto it = dec->sparse_sections.find(idx);
+        if (it != dec->sparse_sections.end()) {
+          dec->sparse_bytes_buffered -= it->second.data.size();
+          dec->sparse_sections.erase(it);
+        }
+      } else if (s_status != jxl::FrameDecoder::kSkipped) {
+        return JXL_INPUT_ERROR("unexpected section status");
+      }
+    }
+    return JXL_DEC_SUCCESS;
+  }
+
   Span<const uint8_t> span;
   JXL_API_RETURN_IF_ERROR(dec->GetCodestreamInput(&span));
-  const auto& toc = dec->frame_dec->Toc();
+  if (dec->codestream_copy.empty() && dec->codestream_pos > 0) {
+    // Still skipping unread bytes from previously skipped sections.
+    return JXL_DEC_SUCCESS;
+  }
+
+  // Skip any contiguous prefix of already-processed or unneeded sections
+  // without buffering their bytes.
+  size_t prefix_skip_bytes = 0;
+  while (dec->next_section < toc.size() &&
+         (dec->section_processed[dec->next_section] == 1 ||
+          !dec->frame_dec->IsSectionRequired(toc[dec->next_section].id))) {
+    dec->section_processed[dec->next_section] = 1;
+    prefix_skip_bytes += toc[dec->next_section].size;
+    ++dec->next_section;
+  }
+  if (prefix_skip_bytes > 0) {
+    dec->remaining_frame_size -= prefix_skip_bytes;
+    dec->AdvanceCodestream(prefix_skip_bytes);
+    JXL_API_RETURN_IF_ERROR(dec->GetCodestreamInput(&span));
+    if (dec->codestream_copy.empty() && dec->codestream_pos > 0) {
+      return JXL_DEC_SUCCESS;
+    }
+  }
+
   size_t pos = 0;
   std::vector<jxl::FrameDecoder::SectionInfo> section_info;
   std::vector<jxl::FrameDecoder::SectionStatus> section_status;
@@ -1146,6 +1548,11 @@ JxlDecoderStatus JxlDecoderProcessSections(JxlDecoder* dec) {
     }
     size_t id = toc[i].id;
     size_t size = toc[i].size;
+    if (!dec->frame_dec->IsSectionRequired(id)) {
+      dec->section_processed[i] = 1;
+      pos += size;
+      continue;
+    }
     if (OutOfBounds(pos, size, span.size())) {
       break;
     }
@@ -1189,12 +1596,16 @@ JxlDecoderStatus JxlDecoderProcessSections(JxlDecoder* dec) {
   }
   size_t completed_prefix_bytes = 0;
   while (dec->next_section < dec->section_processed.size() &&
-         dec->section_processed[dec->next_section] == 1) {
+         (dec->section_processed[dec->next_section] == 1 ||
+          !dec->frame_dec->IsSectionRequired(toc[dec->next_section].id))) {
+    dec->section_processed[dec->next_section] = 1;
     completed_prefix_bytes += toc[dec->next_section].size;
     ++dec->next_section;
   }
-  dec->remaining_frame_size -= completed_prefix_bytes;
-  dec->AdvanceCodestream(completed_prefix_bytes);
+  if (completed_prefix_bytes > 0) {
+    dec->remaining_frame_size -= completed_prefix_bytes;
+    dec->AdvanceCodestream(completed_prefix_bytes);
+  }
   return JXL_DEC_SUCCESS;
 }
 
@@ -1310,6 +1721,16 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
         JXL_API_RETURN_IF_ERROR(dec->frame_dec->InitFrameOutput());
       }
       dec->remaining_frame_size = dec->frame_dec->SumSectionSizes();
+      dec->frame_data_file_offset = dec->CurrentCodestreamFileOffset();
+      dec->frame_data_file_offset_valid =
+          !dec->have_container || (memcmp(dec->box_type, "jxlc", 4) == 0) ||
+          (memcmp(dec->box_type, "jxlp", 4) == 0 &&
+           dec->jxlp_ooo_buffer.empty() &&
+           (dec->box_contents_unbounded ||
+            dec->frame_data_file_offset + dec->remaining_frame_size <=
+                dec->box_contents_end));
+      dec->ClearSparseInput();
+      ApplyDecodeRegionToFrameDecoder(dec);
 
       dec->frame_stage = FrameStage::kTOC;
       if (dec->preview_frame) {
@@ -1451,6 +1872,7 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
         size_t xsize;
         size_t ysize;
         GetCurrentDimensions(dec, xsize, ysize);
+        ApplyDecodeRegionToFrameDecoder(dec);
         size_t bits_per_sample = GetBitDepth(
             dec->image_out_bit_depth, dec->metadata.m, dec->image_out_format);
         JXL_API_RETURN_IF_ERROR(dec->frame_dec->SetImageOutput(
@@ -1499,7 +1921,24 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
 
       if (!all_sections_done) {
         // Not all sections have been processed yet
+        if (dec->sparse_mode_active) {
+          return JXL_DEC_NEED_MORE_INPUT;
+        }
         return dec->RequestMoreInput();
+      }
+
+      PopulateRegionStats(dec, &dec->last_region_stats);
+
+      if (dec->sparse_mode_active) {
+        dec->ClearSparseInput();
+        dec->remaining_frame_size = 0;
+      } else if (dec->remaining_frame_size > 0) {
+        if (dec->codestream_copy.empty() && dec->codestream_pos > 0) {
+          dec->codestream_pos += dec->remaining_frame_size;
+        } else {
+          dec->AdvanceCodestream(dec->remaining_frame_size);
+        }
+        dec->remaining_frame_size = 0;
       }
 
       if (!dec->preview_frame) {
@@ -2493,6 +2932,9 @@ static JxlDecoderStatus GetMinSize(const JxlDecoder* dec,
   if (preview) {
     xsize = dec->metadata.oriented_preview_xsize(dec->keep_orientation);
     ysize = dec->metadata.oriented_preview_ysize(dec->keep_orientation);
+  } else if (dec->has_decode_region) {
+    xsize = dec->decode_region_width;
+    ysize = dec->decode_region_height;
   } else {
     GetCurrentDimensions(dec, xsize, ysize);
   }
