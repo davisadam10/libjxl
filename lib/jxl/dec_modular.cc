@@ -47,6 +47,7 @@
 #include "lib/jxl/epf.h"
 #include "lib/jxl/modular/encoding/encoding.h"
 #include "lib/jxl/modular/modular_image.h"
+#include "lib/jxl/modular/transform/squeeze.h"
 #include "lib/jxl/modular/transform/transform.h"
 
 HWY_BEFORE_NAMESPACE();
@@ -737,10 +738,103 @@ Status ModularFrameDecoder::ModularImageToDecodedRect(
   return true;
 }
 
+bool ModularFrameDecoder::HasSqueezeForDownsampling(size_t downsampling) const {
+  if (!use_full_image || !do_color) return false;
+  if (downsampling != 2 && downsampling != 4 && downsampling != 8) return false;
+  if (full_image.w < downsampling || full_image.h < downsampling) return false;
+  if (full_image.transform.empty() ||
+      full_image.transform.back().id != TransformId::kSqueeze) {
+    return false;
+  }
+  // Ensure earlier transforms are purely pointwise (kRCT or delta-free
+  // kPalette) and there is only one kSqueeze.
+  for (size_t t = 0; t + 1 < full_image.transform.size(); ++t) {
+    const auto& tr = full_image.transform[t];
+    if (tr.id == TransformId::kRCT) continue;
+    if (tr.id == TransformId::kPalette && tr.nb_deltas == 0) continue;
+    return false;
+  }
+  const auto& squeezes = full_image.transform.back().squeezes;
+  if (squeezes.empty()) return false;
+
+  const int target_shift = static_cast<int>(CeilLog2Nonzero(downsampling));
+  // Lightweight dry-run of PartialInvSqueeze on channel metadata to guarantee
+  // every output non-meta channel lands on exact DivCeil(w/h, downsampling).
+  struct ChanMeta {
+    size_t w;
+    size_t h;
+    int hshift;
+    int vshift;
+  };
+  std::vector<ChanMeta> chans;
+  chans.reserve(full_image.channel.size());
+  for (const auto& ch : full_image.channel) {
+    chans.push_back({ch.w, ch.h, ch.hshift, ch.vshift});
+  }
+  size_t nb_meta = full_image.nb_meta_channels;
+  bool skipped_any = false;
+  for (int i = static_cast<int>(squeezes.size()) - 1; i >= 0; --i) {
+    const auto& p = squeezes[i];
+    if (p.begin_c >= chans.size() || p.num_c == 0 ||
+        p.begin_c + p.num_c > chans.size()) {
+      return false;
+    }
+    const uint32_t beginc = p.begin_c;
+    const uint32_t endc = p.begin_c + p.num_c - 1;
+    const uint32_t offset =
+        p.in_place ? (endc + 1) : (chans.size() + beginc - endc - 1);
+    const bool is_meta = (beginc < nb_meta);
+    if (is_meta) {
+      if (nb_meta <= p.num_c) return false;
+      nb_meta -= p.num_c;
+    }
+    for (uint32_t c = beginc; c <= endc; ++c) {
+      const uint32_t rc = offset + c - beginc;
+      if (rc >= chans.size()) return false;
+      const bool need_unsqueeze =
+          is_meta || (p.horizontal ? (chans[c].hshift > target_shift)
+                                   : (chans[c].vshift > target_shift));
+      if (!need_unsqueeze) {
+        skipped_any = true;
+        continue;
+      }
+      if (chans[c].w < chans[rc].w || chans[c].h < chans[rc].h) return false;
+      if (p.horizontal) {
+        if (chans[c].h != chans[rc].h ||
+            (chans[c].w != chans[rc].w && chans[c].w != chans[rc].w + 1)) {
+          return false;
+        }
+        chans[c].w += chans[rc].w;
+        if (chans[c].hshift > 0) chans[c].hshift--;
+      } else {
+        if (chans[c].w != chans[rc].w ||
+            (chans[c].h != chans[rc].h && chans[c].h != chans[rc].h + 1)) {
+          return false;
+        }
+        chans[c].h += chans[rc].h;
+        if (chans[c].vshift > 0) chans[c].vshift--;
+      }
+    }
+    chans.erase(chans.begin() + offset,
+                chans.begin() + offset + (endc - beginc + 1));
+  }
+  if (!skipped_any) return false;
+  const size_t target_w = DivCeil(full_image.w, downsampling);
+  const size_t target_h = DivCeil(full_image.h, downsampling);
+  if (nb_meta >= chans.size()) return false;
+  for (size_t c = nb_meta; c < chans.size(); ++c) {
+    if (chans[c].w != target_w || chans[c].h != target_h) {
+      return false;
+    }
+  }
+  return true;
+}
+
 Status ModularFrameDecoder::FinalizeDecoding(const FrameHeader& frame_header,
                                              PassesDecoderState* dec_state,
                                              jxl::ThreadPool* pool,
-                                             bool inplace) {
+                                             bool inplace,
+                                             size_t downsampling) {
   if (!use_full_image) return true;
   JxlMemoryManager* memory_manager = dec_state->memory_manager();
   Image gi{memory_manager};
@@ -759,6 +853,53 @@ Status ModularFrameDecoder::FinalizeDecoding(const FrameHeader& frame_header,
   if (xsize * ysize < frame_dim.group_dim * frame_dim.group_dim) pool = nullptr;
 
   // Undo the global transforms
+  if (downsampling > 1) {
+    JXL_ENSURE(!gi.transform.empty() &&
+               gi.transform.back().id == TransformId::kSqueeze);
+    const int target_shift = static_cast<int>(CeilLog2Nonzero(downsampling));
+    Transform squeeze_tr = gi.transform.back();
+    gi.transform.pop_back();
+    JXL_RETURN_IF_ERROR(
+        PartialInvSqueeze(gi, squeeze_tr.squeezes, target_shift, pool));
+    const size_t target_w = DivCeil(gi.w, downsampling);
+    const size_t target_h = DivCeil(gi.h, downsampling);
+    gi.w = target_w;
+    gi.h = target_h;
+    for (size_t c = gi.nb_meta_channels; c < gi.channel.size(); ++c) {
+      JXL_ENSURE(gi.channel[c].w == target_w && gi.channel[c].h == target_h);
+      gi.channel[c].hshift = 0;
+      gi.channel[c].vshift = 0;
+    }
+    gi.undo_transforms(global_header.wp_header, pool);
+    JXL_ENSURE(global_transform.empty());
+    if (gi.error) return JXL_FAILURE("Undoing transforms failed");
+
+    FrameDimensions scaled_dim;
+    scaled_dim.Set(target_w, target_h, frame_header.group_size_shift, 0, 0,
+                   false, 1);
+    for (size_t i = 0; i < scaled_dim.num_groups; i++) {
+      dec_state->render_pipeline->ClearDone(i);
+    }
+    const auto init = [&](size_t num_threads) -> Status {
+      JXL_RETURN_IF_ERROR(dec_state->render_pipeline->PrepareForThreads(
+          num_threads, /*use_group_ids=*/false));
+      return true;
+    };
+    const auto process_group = [&](const uint32_t group,
+                                   size_t thread_id) -> Status {
+      RenderPipelineInput input =
+          dec_state->render_pipeline->GetInputBuffers(group, thread_id);
+      JXL_RETURN_IF_ERROR(ModularImageToDecodedRect(
+          frame_header, gi, dec_state, nullptr, input,
+          scaled_dim.GroupRect(group)));
+      JXL_RETURN_IF_ERROR(input.Done());
+      return true;
+    };
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, scaled_dim.num_groups, init,
+                                  process_group, "ModularToRectScaled"));
+    return true;
+  }
+
   gi.undo_transforms(global_header.wp_header, pool);
   JXL_ENSURE(global_transform.empty());
   if (gi.error) return JXL_FAILURE("Undoing transforms failed");

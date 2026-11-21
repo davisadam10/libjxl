@@ -12,7 +12,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -292,10 +294,14 @@ class WriteToOutputStage : public RenderPipelineStage {
                      size_t alpha_c, Orientation undo_orientation,
                      const std::vector<ImageOutput>& extra_output,
                      JxlMemoryManager* memory_manager,
-                     const Rect& output_region, const Rect& unoriented_region)
+                     const Rect& output_region, const Rect& unoriented_region,
+                     size_t downsampling)
       : RenderPipelineStage(RenderPipelineStage::Settings()),
         width_(width),
         height_(height),
+        downsampling_(downsampling > 1 ? downsampling : 1),
+        scaled_width_(DivCeil(width, downsampling_)),
+        scaled_height_(DivCeil(height, downsampling_)),
         main_(main_output),
         num_color_(main_.num_channels_ < 3 ? 1 : 3),
         want_alpha_(main_.num_channels_ == 2 || main_.num_channels_ == 4),
@@ -308,12 +314,25 @@ class WriteToOutputStage : public RenderPipelineStage {
         output_region_(
             output_region.xsize() > 0 && output_region.ysize() > 0
                 ? output_region
-                : Rect(0, 0, transpose_ ? height : width,
-                       transpose_ ? width : height)),
-        unoriented_region_(
+                : Rect(0, 0, transpose_ ? scaled_height_ : scaled_width_,
+                       transpose_ ? scaled_width_ : scaled_height_)),
+        unoriented_scaled_region_(
             unoriented_region.xsize() > 0 && unoriented_region.ysize() > 0
                 ? unoriented_region
-                : Rect(0, 0, width, height)),
+                : Rect(0, 0, scaled_width_, scaled_height_)),
+        unoriented_region_(
+            downsampling_ > 1
+                ? Rect(
+                      unoriented_scaled_region_.x0() * downsampling_,
+                      unoriented_scaled_region_.y0() * downsampling_,
+                      std::min(width_,
+                               unoriented_scaled_region_.x1() * downsampling_) -
+                          unoriented_scaled_region_.x0() * downsampling_,
+                      std::min(height_,
+                               unoriented_scaled_region_.y1() * downsampling_) -
+                          unoriented_scaled_region_.y0() * downsampling_)
+                : unoriented_scaled_region_),
+        accum_channels_(num_color_ + (has_alpha_ ? 1 : 0)),
         opaque_alpha_(kChunkSize, 1.0f),
         memory_manager_(memory_manager) {
     for (size_t ec = 0; ec < extra_output.size(); ++ec) {
@@ -352,6 +371,41 @@ class WriteToOutputStage : public RenderPipelineStage {
     size_t clip_x0 = std::max(xpos, unoriented_region_.x0());
     size_t clip_x1 = std::min(xpos + xsize, unoriented_region_.x1());
     if (clip_x0 >= clip_x1) return true;
+
+    if (downsampling_ > 1) {
+      const size_t sy = ypos / downsampling_ - unoriented_scaled_region_.y0();
+      const size_t rw = unoriented_scaled_region_.xsize();
+      const size_t sx0_base = unoriented_scaled_region_.x0();
+      const float* color_rows[4];
+      for (size_t c = 0; c < num_color_; ++c) {
+        color_rows[c] = GetInputRow(input_rows, c, 0);
+      }
+      if (has_alpha_) {
+        color_rows[num_color_] = GetInputRow(input_rows, alpha_c_, 0);
+      }
+      std::lock_guard<std::mutex> lock(
+          row_mutexes_[sy % row_mutexes_.size()]);
+      float* dst_row = accum_main_.data() + sy * rw * accum_channels_;
+      for (size_t x = clip_x0; x < clip_x1; ++x) {
+        const size_t sx = x / downsampling_ - sx0_base;
+        const size_t in_idx = x - xpos;
+        float* dst = dst_row + sx * accum_channels_;
+        for (size_t c = 0; c < accum_channels_; ++c) {
+          dst[c] += color_rows[c][in_idx];
+        }
+      }
+      for (size_t ec = 0; ec < extra_channels_.size(); ++ec) {
+        const float* ec_row =
+            GetInputRow(input_rows, extra_channels_[ec].channel_index_, 0);
+        float* ec_dst = accum_extra_[ec].data() + sy * rw;
+        for (size_t x = clip_x0; x < clip_x1; ++x) {
+          const size_t sx = x / downsampling_ - sx0_base;
+          ec_dst[sx] += ec_row[x - xpos];
+        }
+      }
+      return true;
+    }
+
     if (flip_y_) {
       ypos = height_ - 1u - ypos;
     }
@@ -382,6 +436,64 @@ class WriteToOutputStage : public RenderPipelineStage {
         OutputBuffers(extra, thread_id, ypos, xstart, len, line_buffers);
       }
     }
+    return true;
+  }
+
+  Status FinalizeOutput() override {
+    if (downsampling_ <= 1 || accum_main_.empty()) {
+      return true;
+    }
+    const size_t rw = unoriented_scaled_region_.xsize();
+    const size_t rh = unoriented_scaled_region_.ysize();
+    float chunk_buf[4][kChunkSize];
+    for (size_t sy_rel = 0; sy_rel < rh; ++sy_rel) {
+      const size_t sy_abs = unoriented_scaled_region_.y0() + sy_rel;
+      const size_t fy0 = sy_abs * downsampling_;
+      const size_t tile_h = std::min(height_, fy0 + downsampling_) - fy0;
+      const size_t ypos = flip_y_ ? (scaled_height_ - 1u - sy_abs) : sy_abs;
+      for (size_t sx_rel = 0; sx_rel < rw; sx_rel += kChunkSize) {
+        const size_t len = std::min<size_t>(kChunkSize, rw - sx_rel);
+        const size_t xstart = unoriented_scaled_region_.x0() + sx_rel;
+        for (size_t i = 0; i < len; ++i) {
+          const size_t sx_abs = xstart + i;
+          const size_t fx0 = sx_abs * downsampling_;
+          const size_t tile_w = std::min(width_, fx0 + downsampling_) - fx0;
+          const float inv_area = 1.0f / static_cast<float>(tile_w * tile_h);
+          const size_t base = (sy_rel * rw + sx_rel + i) * accum_channels_;
+          for (size_t c = 0; c < accum_channels_; ++c) {
+            chunk_buf[c][i] = accum_main_[base + c] * inv_area;
+          }
+        }
+        const float* line_buffers[4];
+        for (size_t c = 0; c < num_color_; ++c) {
+          line_buffers[c] = chunk_buf[c];
+        }
+        if (has_alpha_) {
+          line_buffers[num_color_] = chunk_buf[num_color_];
+        } else {
+          line_buffers[num_color_] = opaque_alpha_.data();
+        }
+        if (has_alpha_ && want_alpha_ && unpremul_alpha_) {
+          UnpremulAlpha(/*thread_id=*/0, len, line_buffers);
+        }
+        OutputBuffers(main_, /*thread_id=*/0, ypos, xstart, len, line_buffers);
+        for (size_t ec = 0; ec < extra_channels_.size(); ++ec) {
+          for (size_t i = 0; i < len; ++i) {
+            const size_t sx_abs = xstart + i;
+            const size_t fx0 = sx_abs * downsampling_;
+            const size_t tile_w = std::min(width_, fx0 + downsampling_) - fx0;
+            const float inv_area = 1.0f / static_cast<float>(tile_w * tile_h);
+            chunk_buf[0][i] =
+                accum_extra_[ec][sy_rel * rw + sx_rel + i] * inv_area;
+          }
+          line_buffers[0] = chunk_buf[0];
+          OutputBuffers(extra_channels_[ec], /*thread_id=*/0, ypos, xstart, len,
+                        line_buffers);
+        }
+      }
+    }
+    accum_main_.clear();
+    accum_extra_.clear();
     return true;
   }
 
@@ -452,6 +564,16 @@ class WriteToOutputStage : public RenderPipelineStage {
         JXL_ASSIGN_OR_RETURN(
             temp, AlignedMemory::Create(memory_manager_, alloc_size));
       }
+    }
+    if (downsampling_ > 1 && accum_main_.empty()) {
+      const size_t rw = unoriented_scaled_region_.xsize();
+      const size_t rh = unoriented_scaled_region_.ysize();
+      accum_main_.assign(rw * rh * accum_channels_, 0.0f);
+      accum_extra_.resize(extra_channels_.size());
+      for (auto& ec_buf : accum_extra_) {
+        ec_buf.assign(rw * rh, 0.0f);
+      }
+      row_mutexes_.resize(std::max<size_t>(1, std::min<size_t>(rh, 64)));
     }
     return true;
   }
@@ -558,7 +680,8 @@ class WriteToOutputStage : public RenderPipelineStage {
     for (size_t c = 0; c < out.num_channels_; ++c) {
       line_buffers[c] = temp_in[c];
     }
-    *xstart = width_ - *xstart - len;
+    const size_t flip_w = (downsampling_ > 1) ? scaled_width_ : width_;
+    *xstart = flip_w - *xstart - len;
   }
 
   template <typename T>
@@ -716,6 +839,9 @@ class WriteToOutputStage : public RenderPipelineStage {
   // Process row in chunks to keep per-thread buffers compact.
   size_t width_;
   size_t height_;
+  size_t downsampling_;
+  size_t scaled_width_;
+  size_t scaled_height_;
   Output main_;  // color + alpha
   size_t num_color_;
   bool want_alpha_;
@@ -726,23 +852,29 @@ class WriteToOutputStage : public RenderPipelineStage {
   bool flip_y_;
   bool transpose_;
   Rect output_region_;
+  Rect unoriented_scaled_region_;
   Rect unoriented_region_;
+  size_t accum_channels_;
   std::vector<Output> extra_channels_;
   std::vector<float> opaque_alpha_;
   JxlMemoryManager* memory_manager_;
   std::vector<AlignedMemory> temp_in_;
   std::vector<AlignedMemory> temp_out_;
+  mutable std::vector<float> accum_main_;
+  mutable std::vector<std::vector<float>> accum_extra_;
+  mutable std::deque<std::mutex> row_mutexes_;
 };
 
 std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
     const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
     bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
     std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager,
-    const Rect& output_region, const Rect& unoriented_region) {
+    const Rect& output_region, const Rect& unoriented_region,
+    size_t downsampling) {
   return jxl::make_unique<WriteToOutputStage>(
       main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
       undo_orientation, extra_output, memory_manager, output_region,
-      unoriented_region);
+      unoriented_region, downsampling);
 }
 
 // NOLINTNEXTLINE(google-readability-namespace-comments)
@@ -877,11 +1009,12 @@ std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
     const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
     bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
     std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager,
-    const Rect& output_region, const Rect& unoriented_region) {
+    const Rect& output_region, const Rect& unoriented_region,
+    size_t downsampling) {
   return HWY_DYNAMIC_DISPATCH(GetWriteToOutputStage)(
       main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
       undo_orientation, extra_output, memory_manager, output_region,
-      unoriented_region);
+      unoriented_region, downsampling);
 }
 
 }  // namespace jxl

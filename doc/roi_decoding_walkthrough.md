@@ -2,29 +2,29 @@
 
 ## Summary of Changes
 
-Implemented all four approved phases aligned with upstream `libjxl` maintainer discussions (**#1623**, **#1294**, **#3519**, **#668**, **#1133**, **#5143**, **#586**, **#4328**, **#3881**) while keeping the stable public header [decode.h](../lib/include/jxl/decode.h) **100% untouched**:
+Implemented all four approved phases aligned with upstream `libjxl` maintainer discussions (**#1623**, **#1294**, **#3519**, **#668**, **#1133**, **#5143**, **#586**, **#4328**, **#3881**) while keeping the stable public header [decode.h](file:///home/antigravity/davisadam10/libjxl/lib/include/jxl/decode.h) **100% untouched**:
 
 ### 1. Experimental Prototype C Header (`decode_roi_experimental.h`)
-- **[NEW]** [decode_roi_experimental.h](../lib/include/jxl/decode_roi_experimental.h) (registered in [jxl_lists.cmake](../lib/jxl_lists.cmake)):
+- **[NEW]** [decode_roi_experimental.h](file:///home/antigravity/davisadam10/libjxl/lib/include/jxl/decode_roi_experimental.h) (registered in [jxl_lists.cmake](file:///home/antigravity/davisadam10/libjxl/lib/jxl_lists.cmake)):
   - `JxlDecoderExperimentalSetOutputRegion(dec, x, y, width, height)` — sets (or clears with `0, 0`) the requested output ROI in oriented output coordinates.
   - `JxlDecoderExperimentalGetRequiredInputRanges(dec, ranges, range_count)` — two-call sizing API returning coalesced original file byte ranges (`JxlExperimentalInputRange { offset, length }`) required to decode the ROI and its dependencies.
   - `JxlDecoderExperimentalSetInputAtOffset(dec, data, size, offset)` — bounded sparse/discontinuous input supporting arbitrary order, partial chunks, overlaps, and duplicates without requiring bytes outside the ROI.
   - `JxlDecoderExperimentalGetRegionDecodeStats(dec, stats)` — exposes `JxlExperimentalRegionFallbackReason`, group skip counts, required section counts, and planned byte totals.
 
 ### 2. Output & Render Pipeline Region Primitives
-- [dec_cache.h](../lib/jxl/dec_cache.h) & [dec_cache.cc](../lib/jxl/dec_cache.cc): Added `PassesDecoderState::output_region` and `ComputeUnorientedRegion()` (inverting `transpose` → `flip_x` → `flip_y`), forwarding region coordinates to `WriteToOutputStage`, `FastXYBStage`, and `RenderPipeline::SetRenderRegion` (suppressed on referenceable frames so `frame_storage_for_referencing` stays complete).
-- [stage_write.h](../lib/jxl/render_pipeline/stage_write.h), [stage_write.cc](../lib/jxl/render_pipeline/stage_write.cc), [stage_xyb.h](../lib/jxl/render_pipeline/stage_xyb.h), [stage_xyb.cc](../lib/jxl/render_pipeline/stage_xyb.cc): Clip rows to `unoriented_region` while preserving full-image post-flip coordinates for `FlipX` and 8-bit ordered dithering (`kDither`), subtracting region origin only at final buffer/callback write.
-- [render_pipeline.h](../lib/jxl/render_pipeline/render_pipeline.h), [low_memory_render_pipeline.h](../lib/jxl/render_pipeline/low_memory_render_pipeline.h), [low_memory_render_pipeline.cc](../lib/jxl/render_pipeline/low_memory_render_pipeline.cc): Added `GroupBorder()`, `BaseColorShift()`, `SetRenderRegion()`, `RenderOutOfFramePadding()` (up to 4 disjoint out-of-frame strips for blended/cropped frames), and skipping of disjoint `ready_rect`s.
+- [dec_cache.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_cache.h) & [dec_cache.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_cache.cc): Added `PassesDecoderState::output_region` and `ComputeUnorientedRegion()` (inverting `transpose` → `flip_x` → `flip_y`), forwarding region coordinates to `WriteToOutputStage`, `FastXYBStage`, and `RenderPipeline::SetRenderRegion` (suppressed on referenceable frames so `frame_storage_for_referencing` stays complete).
+- [stage_write.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/stage_write.h), [stage_write.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/stage_write.cc), [stage_xyb.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/stage_xyb.h), [stage_xyb.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/stage_xyb.cc): Clip rows to `unoriented_region` while preserving full-image post-flip coordinates for `FlipX` and 8-bit ordered dithering (`kDither`), subtracting region origin only at final buffer/callback write.
+- [render_pipeline.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/render_pipeline.h), [low_memory_render_pipeline.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/low_memory_render_pipeline.h), [low_memory_render_pipeline.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/low_memory_render_pipeline.cc): Added `GroupBorder()`, `BaseColorShift()`, `SetRenderRegion()`, `RenderOutOfFramePadding()` (up to 4 disjoint out-of-frame strips for blended/cropped frames), and skipping of disjoint `ready_rect`s.
 
 ### 3. FrameDecoder Dependency & TOC Byte-Range Planner
-- [dec_frame.h](../lib/jxl/dec_frame.h) & [dec_frame.cc](../lib/jxl/dec_frame.cc):
+- [dec_frame.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_frame.h) & [dec_frame.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_frame.cc):
   - Recorded `section_codestream_offsets_` in `InitFrame()`.
   - Implemented `EstimateGroupBorderFromHeader()` and `PlanRequiredGroups(bool after_dc_global)` so required groups and coalesced file byte ranges can be planned immediately after `FrameHeader + TOC`, and refined after DC Global (with explicit `RegionFallbackReason::kModularGlobalTransforms` fallback if `ModularFrameDecoder::UsesFullImage()` is true).
   - Implemented `GetRequiredCodestreamRanges()` (handling arbitrary TOC permutations) and `GetRegionDecodeStats()`.
   - Updated `SetImageOutput`, `AddExtraChannelOutput`, `ProcessSections`, `Flush`, `HasDecodedAll`, `NumCompletePasses`, `HasEverything`, and `FinalizeFrame`.
 
 ### 4. Streaming Zero-Buffer Skip & Sparse Input Assembly
-- [decode.cc](../lib/jxl/decode.cc):
+- [decode.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/decode.cc):
   - Tracked exact `frame_data_file_offset` and `frame_data_file_offset_valid` at the end of `FrameStage::kHeader` (supporting bare codestreams, `jxlc` containers, and contiguous `jxlp` boxes).
   - Implemented bounded sparse section assembly (`SparseSectionData` + `MergeInterval`) and sparse dispatch in `JxlDecoderProcessSections` (freeing each section buffer as soon as it is decoded).
   - Upgraded sequential push streaming in `JxlDecoderProcessSections` to skip unneeded sections via `AdvanceCodestream()` with zero byte buffering and emit `JXL_DEC_FULL_IMAGE` early once all required sections complete.
@@ -38,13 +38,13 @@ Implemented all four approved phases aligned with upstream `libjxl` maintainer d
 | Suite | Command | Result |
 |---|---|---|
 | New ROI, Range Planning, Sparse I/O & Streaming Suite | `./build/lib/tests/decode_region_test` | **11 / 11 PASSED** (7.59 s, 0 pixel diffs) |
-| On-Demand 8K RGB HALF Sparse Benchmark | `./build/lib/tests/decode_region_test --gtest_also_run_disabled_tests --gtest_filter=*Float8k*` | **1 / 1 PASSED** (2.32 s, 0 pixel diffs) |
+| On-Demand 8K ACES RGB HALF Sparse Benchmark | `./build/lib/tests/decode_region_test --gtest_also_run_disabled_tests --gtest_filter=*Aces8k*` | **1 / 1 PASSED** (2.32 s, 0 pixel diffs) |
 | Existing Render Pipeline Regression Suite | `./build/lib/tests/render_pipeline_test` | **1,198 / 1,198 PASSED** (37.9 s) |
 | Existing Decoder Regression Suite | `./build/lib/tests/decode_test` | **2,895 / 2,895 PASSED** (30.6 s) |
 
-### Key Coverage Verified in [decode_region_test.cc](../lib/jxl/decode_region_test.cc)
+### Key Coverage Verified in [decode_region_test.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/decode_region_test.cc)
 - **`SparseRandomAccessAndRangePlanning`**: Bare codestream, `jxlc` container, reversed/sub-chunked/overlapping sparse delivery, and center-first permuted TOC (`group_order = 1`) — all 0-diff bit-exact with `> 48 / 64` groups skipped and `< 50%` bytes read.
-- **`Float2kRgbHalfSparseRandomAccess`**: Fast 2K (2048×1080) linear RGB HALF (`JXL_TYPE_FLOAT16`) lossless Modular sparse random-access (bare + container); aligned 256×256 crop decodes **1 / 40 groups** with 0-diff bitwise FP16 equality.
+- **`Aces2kRgbHalfSparseRandomAccess`**: Fast 2K (2048×1080) ACEScg linear RGB HALF (`JXL_TYPE_FLOAT16`) lossless Modular sparse random-access (bare + container); aligned 256×256 crop decodes **1 / 40 groups** with 0-diff bitwise FP16 equality.
 - **`All65536HalfPatternsBitExact`** (#3881): All 65,536 IEEE-754 HALF bit patterns (all finite normals, all subnormals, `-0.0`, and Inf/NaN) across 4 groups — 100% bitwise equal to full-frame `libjxl` decode.
 - **`VarDCTFeatureCombinations` & `LargeVarDCT2KRegions`**: Gaborish on/off, EPF 0/1/2/3, noise synthesis, resampling 2×/4×, progressive multi-pass, permuted TOC, unaligned 4-group crossings, 1×1 pixel, and full-image crops.
 - **`ModularGroupIndependentAndSqueezeFallback`**: Verified group-skipping lossless Modular (`JXL_EXP_FALLBACK_NONE`) and global Squeeze fallback (`JXL_EXP_FALLBACK_MODULAR_GLOBAL_TRANSFORMS`) under both sequential streaming and 2-round sparse input.
@@ -57,3 +57,48 @@ Implemented all four approved phases aligned with upstream `libjxl` maintainer d
 - **I/O reduction**: **1.27 MB** read out of **161.1 MB** (**0.79%** of file — **126× less storage I/O**) in **3** coalesced byte ranges.
 - **Compute reduction**: **4 / 510** groups decoded (**506 groups skipped**).
 - **Latency**: **10.9 ms** vs. **1,365.7 ms** full decode (**125× faster**), with **100% bitwise identical** FP16 pixels.
+
+---
+
+# Part 2: Power-of-Two Reduced-Resolution (Downscaled) Decoding
+
+## Summary of Changes
+
+Implemented upstream-aligned experimental power-of-two downscaled decoding (`factor ∈ {1, 2, 4, 8}`) inside the same experimental header [decode_roi_experimental.h](file:///home/antigravity/davisadam10/libjxl/lib/include/jxl/decode_roi_experimental.h), keeping [decode.h](file:///home/antigravity/davisadam10/libjxl/lib/include/jxl/decode.h) **100% untouched**:
+
+### 1. Experimental Downscaling API & Exactness Policies
+- [decode_roi_experimental.h](file:///home/antigravity/davisadam10/libjxl/lib/include/jxl/decode_roi_experimental.h) & [decode.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/decode.cc):
+  - Added `JxlExperimentalScalePolicy` (`JXL_EXP_SCALE_FAST_APPROXIMATE`, `JXL_EXP_SCALE_REQUIRE_FAST_NATIVE`, `JXL_EXP_SCALE_REFERENCE_RESAMPLE`) and `JxlExperimentalScaleDecodeMode` (`NONE`, `NATIVE_VARDCT_DC`, `MODULAR_SQUEEZE_NATIVE`, `PROGRESSIVE_PASS_SKIP`, `STREAMING_DOWNSAMPLE_FALLBACK`).
+  - Added `JxlDecoderExperimentalSetOutputDownsampling(dec, downsampling, policy)` and `JxlDecoderExperimentalGetScaledOutputInfo(dec, xsize, ysize, fast_native_available, scale_mode)`.
+  - Extended `JxlExperimentalRegionDecodeStats` with `downsampling`, `scale_policy`, `scale_mode`, `total_passes`, and `required_passes`.
+  - Updated `GetMinSize` and `ValidateDecodeRegionBounds` so buffer sizes reflect `DivCeil(W, factor) × DivCeil(H, factor)` (or the ROI dimensions in scaled output coordinates when combined with `SetOutputRegion`).
+
+### 2. All Four Downscaling Decode Paths
+- **Path A — Native VarDCT 1:8 DC** ([dec_frame.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_frame.h), [dec_frame.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_frame.cc), [dec_cache.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_cache.h), [dec_cache.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_cache.cc)):
+  - Skips AC Global and all AC groups (`required_groups = 0`, `required_passes = 0`), feeds `shared->dc` directly into a native `DivCeil(W, 8) × DivCeil(H, 8)` color-conversion + output pipeline.
+- **Path B — Native Modular Squeeze Partial Inverse** ([squeeze.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/modular/transform/squeeze.h), [squeeze.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/modular/transform/squeeze.cc), [dec_modular.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_modular.h), [dec_modular.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_modular.cc)):
+  - Added `PartialInvSqueeze()` stopping inverse Haar steps at `target_shift = CeilLog2Nonzero(factor)` and `ModularFrameDecoder::HasSqueezeForDownsampling()` (metadata dry-run guaranteeing exact `DivCeil(W, factor) × DivCeil(H, factor)` dimensions across all channels).
+  - Skips ModularAC passes with `maxShift < target_shift` (and skips AC Global + all AC passes at `1:8` since shifts `>= 3` live in `ModularDC`).
+- **Path C — Progressive VarDCT Pass Skipping** ([dec_frame.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/dec_frame.cc)):
+  - Selects the smallest pass count `k` satisfying `GetDownsamplingTargetForCompletedPasses(k) <= factor`, skips finer passes in `IsSectionRequiredPlanned` / `GetRequiredCodestreamRanges`, and sets `force_draw = true` on the final required pass.
+  - Composes cleanly with spatial ROI group skipping.
+- **Path D — Low-Memory Streaming Float Box Downsample** ([render_pipeline_stage.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/render_pipeline_stage.h), [render_pipeline.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/render_pipeline.h), [stage_write.h](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/stage_write.h), [stage_write.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/render_pipeline/stage_write.cc)):
+  - Accumulates full-res rows in unclamped `float` space (preserving negative values, HDR highlights `> 1.0`, subnormals, and `-0.0`) with row-striped mutexes and exact border-tile division `tile_w * tile_h` in `WriteToOutputStage::FinalizeOutput()`.
+  - Handles all 8 EXIF orientations, extra channels, alpha unpremultiplication, and pixel callbacks.
+
+## Verification & Validation Results (Part 2)
+
+| Suite | Command | Result |
+|---|---|---|
+| New Downscaled Decoding Suite ([decode_scale_test.cc](file:///home/antigravity/davisadam10/libjxl/lib/jxl/decode_scale_test.cc)) | `./build/lib/tests/decode_scale_test` | **10 / 10 PASSED** (1.21 s) |
+| On-Demand 8K→2K/1K RGB HALF Benchmark | `./build/lib/tests/decode_scale_test --gtest_also_run_disabled_tests --gtest_filter=*Float8kTo2k*` | **1 / 1 PASSED** (8.11 s) |
+| Experimental ROI & Sparse I/O Suite | `./build/lib/tests/decode_region_test` | **11 / 11 PASSED** (7.50 s) |
+| Existing Render Pipeline Regression Suite | `./build/lib/tests/render_pipeline_test --gtest_brief=1` | **1,198 / 1,198 PASSED** |
+| Existing Decoder Regression Suite | `./build/lib/tests/decode_test --gtest_brief=1` | **2,895 / 2,895 PASSED** (31.97 s) |
+
+### 8K (8192×4320) RGB HALF Progressive VarDCT Downscale Benchmark
+```text
+[8K Benchmark] total=16512334 B | full=537.7 ms | 1:4(2K)=332.4 ms (2584855 B, mode=3) | 1:8(1K)=51.3 ms (613854 B, mode=1)
+```
+- **8K → 2K (1:4, Progressive Pass Skip)**: **332.4 ms** vs. **537.7 ms** full decode, reading **2.58 MB / 16.51 MB (15.7%)**.
+- **8K → 1K (1:8, Native VarDCT 1:8 DC)**: **51.3 ms** (**10.5× faster**), reading **613.9 KB / 16.51 MB (3.7%)**.

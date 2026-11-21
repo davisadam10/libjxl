@@ -35,7 +35,8 @@ std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
     const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
     bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
     std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager,
-    const Rect& output_region = Rect(), const Rect& unoriented_region = Rect());
+    const Rect& output_region = Rect(), const Rect& unoriented_region = Rect(),
+    size_t downsampling = 1);
 
 }  // namespace jxl
 
