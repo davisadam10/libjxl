@@ -105,9 +105,15 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
                                            ImageBundle* decoded,
                                            PipelineOptions options) {
   JxlMemoryManager* memory_manager = this->memory_manager();
+  const size_t eff_ds = output_downsampling > 1 ? output_downsampling : 1;
+  const size_t scaled_w = DivCeil(width, eff_ds);
+  const size_t scaled_h = DivCeil(height, eff_ds);
+  const bool use_native_scaled = native_scaled_pipeline && eff_ds > 1;
+
   size_t num_c = 3 + frame_header.nonserialized_metadata->m.num_extra_channels;
   bool render_noise =
-      (options.render_noise && (frame_header.flags & FrameHeader::kNoise) != 0);
+      (!use_native_scaled && options.render_noise &&
+       (frame_header.flags & FrameHeader::kNoise) != 0);
   size_t num_tmp_c = render_noise ? 3 : 0;
 
   if (frame_header.CanBeReferenced()) {
@@ -121,14 +127,15 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
     builder.UseSimpleImplementation();
   }
 
-  if (!frame_header.chroma_subsampling.Is444()) {
-    for (size_t c = 0; c < 3; c++) {
-      if (frame_header.chroma_subsampling.HShift(c) != 0) {
-        JXL_RETURN_IF_ERROR(
-            builder.AddStage(GetChromaUpsamplingStage(c, /*horizontal=*/true)));
-      }
-      if (frame_header.chroma_subsampling.VShift(c) != 0) {
-        JXL_RETURN_IF_ERROR(builder.AddStage(
+  if (!use_native_scaled) {
+    if (!frame_header.chroma_subsampling.Is444()) {
+      for (size_t c = 0; c < 3; c++) {
+        if (frame_header.chroma_subsampling.HShift(c) != 0) {
+          JXL_RETURN_IF_ERROR(builder.AddStage(
+              GetChromaUpsamplingStage(c, /*horizontal=*/true)));
+        }
+        if (frame_header.chroma_subsampling.VShift(c) != 0) {
+          JXL_RETURN_IF_ERROR(builder.AddStage(
             GetChromaUpsamplingStage(c, /*horizontal=*/false)));
       }
     }
@@ -220,11 +227,12 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
       break;
     }
   }
+  }  // !use_native_scaled
 
-  const Rect unoriented_region =
-      ComputeUnorientedRegion(output_region, width, height, undo_orientation);
+  const Rect unoriented_scaled_region = ComputeUnorientedRegion(
+      output_region, scaled_w, scaled_h, undo_orientation);
 
-  if (fast_xyb_srgb8_conversion) {
+  if (fast_xyb_srgb8_conversion && eff_ds == 1) {
 #if !JXL_HIGH_PRECISION
     JXL_ENSURE(!NeedsBlending(frame_header));
     JXL_ENSURE(!frame_header.CanBeReferenced() ||
@@ -337,20 +345,51 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
     (void)linear;
 
     if (main_output.callback.IsPresent() || main_output.buffer) {
-      JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToOutputStage(
-          main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
-          undo_orientation, extra_output, memory_manager, output_region,
-          unoriented_region)));
+      if (use_native_scaled) {
+        JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToOutputStage(
+            main_output, scaled_w, scaled_h, has_alpha, unpremul_alpha, alpha_c,
+            undo_orientation, extra_output, memory_manager, output_region,
+            unoriented_scaled_region, /*downsampling=*/1)));
+      } else {
+        JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToOutputStage(
+            main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
+            undo_orientation, extra_output, memory_manager, output_region,
+            unoriented_scaled_region, eff_ds)));
+      }
     } else {
       JXL_RETURN_IF_ERROR(builder.AddStage(
           GetWriteToImageBundleStage(decoded, output_encoding_info)));
     }
   }
-  JXL_ASSIGN_OR_RETURN(render_pipeline,
-                       std::move(builder).Finalize(shared->frame_dim));
-  if (unoriented_region.xsize() > 0 && unoriented_region.ysize() > 0 &&
-      !frame_header.CanBeReferenced() && frame_header.dc_level == 0) {
-    render_pipeline->SetRenderRegion(unoriented_region);
+  if (use_native_scaled) {
+    FrameDimensions scaled_dim;
+    scaled_dim.Set(scaled_w, scaled_h, frame_header.group_size_shift, 0, 0,
+                   false, 1);
+    JXL_ASSIGN_OR_RETURN(render_pipeline,
+                         std::move(builder).Finalize(scaled_dim));
+    if (unoriented_scaled_region.xsize() > 0 &&
+        unoriented_scaled_region.ysize() > 0) {
+      render_pipeline->SetRenderRegion(unoriented_scaled_region);
+    }
+  } else {
+    JXL_ASSIGN_OR_RETURN(render_pipeline,
+                         std::move(builder).Finalize(shared->frame_dim));
+    Rect unoriented_render_region = unoriented_scaled_region;
+    if (eff_ds > 1 && unoriented_scaled_region.xsize() > 0 &&
+        unoriented_scaled_region.ysize() > 0) {
+      const size_t rx0 = unoriented_scaled_region.x0() * eff_ds;
+      const size_t ry0 = unoriented_scaled_region.y0() * eff_ds;
+      const size_t rx1 =
+          std::min(width, unoriented_scaled_region.x1() * eff_ds);
+      const size_t ry1 =
+          std::min(height, unoriented_scaled_region.y1() * eff_ds);
+      unoriented_render_region = Rect(rx0, ry0, rx1 - rx0, ry1 - ry0);
+    }
+    if (unoriented_render_region.xsize() > 0 &&
+        unoriented_render_region.ysize() > 0 &&
+        !frame_header.CanBeReferenced() && frame_header.dc_level == 0) {
+      render_pipeline->SetRenderRegion(unoriented_render_region);
+    }
   }
   return render_pipeline->IsInitialized();
 }

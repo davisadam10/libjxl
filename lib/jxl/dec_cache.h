@@ -109,9 +109,16 @@ struct PassesDecoderState {
   // Image dimensions before applying undo_orientation.
   size_t width;
   size_t height;
-  // Optional target output region in oriented output coordinates.
+  // Optional target output region in oriented output coordinates (in scaled
+  // output coordinates when output_downsampling > 1).
   // Empty (xsize == 0 || ysize == 0) means full image.
   Rect output_region;
+  // Power-of-two output downsampling factor (1, 2, 4, or 8).
+  size_t output_downsampling = 1;
+  // If true, the render pipeline operates directly at native scaled dimensions
+  // (e.g. VarDCT 1:8 DC or Modular Squeeze partial inverse) without full-res
+  // filters/upsampling.
+  bool native_scaled_pipeline = false;
   ImageOutput main_output;
   std::vector<ImageOutput> extra_output;
 
@@ -202,6 +209,8 @@ struct PassesDecoderState {
     b_dm_multiplier = std::pow(1 / (1.25f), frame_header.b_qm_scale - 2.0f);
 
     output_region = Rect();
+    output_downsampling = 1;
+    native_scaled_pipeline = false;
     main_output.callback = PixelCallback();
     main_output.buffer = nullptr;
     extra_output.clear();

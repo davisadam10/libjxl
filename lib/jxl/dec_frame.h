@@ -137,6 +137,20 @@ class FrameDecoder {
     kJpegReconstruction = 6,
   };
 
+  enum class ScalePolicy {
+    kFastApproximate = 0,
+    kRequireFastNative = 1,
+    kReferenceResample = 2,
+  };
+
+  enum class ScaleDecodeMode {
+    kNone = 0,
+    kNativeVarDCTDC = 1,
+    kModularSqueezeNative = 2,
+    kProgressivePassSkip = 3,
+    kStreamingDownsampleFallback = 4,
+  };
+
   struct RegionDecodeStats {
     RegionFallbackReason fallback_reason = RegionFallbackReason::kNoRegion;
     size_t total_groups = 0;
@@ -145,6 +159,11 @@ class FrameDecoder {
     size_t total_sections = 0;
     size_t required_sections = 0;
     uint64_t total_frame_payload_bytes = 0;
+    size_t downsampling = 1;
+    ScalePolicy scale_policy = ScalePolicy::kFastApproximate;
+    ScaleDecodeMode scale_mode = ScaleDecodeMode::kNone;
+    size_t total_passes = 0;
+    size_t required_passes = 0;
   };
 
   // Returns whether a DC image has been decoded, accessible at low resolution
@@ -167,14 +186,38 @@ class FrameDecoder {
     PlanRequiredGroups(/*after_dc_global=*/finalized_dc_);
   }
 
+  void SetOutputDownsampling(size_t downsampling, ScalePolicy policy) {
+    output_downsampling_ = (downsampling > 1) ? downsampling : 1;
+    scale_policy_ = policy;
+    PlanRequiredGroups(/*after_dc_global=*/finalized_dc_);
+  }
+
+  size_t OutputDownsampling() const { return output_downsampling_; }
+  ScalePolicy GetScalePolicy() const { return scale_policy_; }
+  ScaleDecodeMode GetScaleMode() const { return scale_mode_; }
+  bool IsFastNativeScaleAvailable() const {
+    return output_downsampling_ <= 1 ||
+           scale_mode_ == ScaleDecodeMode::kNativeVarDCTDC ||
+           scale_mode_ == ScaleDecodeMode::kModularSqueezeNative ||
+           scale_mode_ == ScaleDecodeMode::kProgressivePassSkip;
+  }
+
   // Returns true if section `section_id` is required under the current plan
   // (works even before finalized_dc_ for TOC range planning / sparse input).
   bool IsSectionRequiredPlanned(size_t section_id) const {
-    if (!can_skip_ac_groups_) return true;
+    if (toc_.size() <= 1) return true;
+    if (scale_mode_ == ScaleDecodeMode::kNativeVarDCTDC ||
+        (scale_mode_ == ScaleDecodeMode::kModularSqueezeNative &&
+         required_passes_ == 0)) {
+      return section_id <= frame_dim_.num_dc_groups;
+    }
     const size_t ac_global_index = frame_dim_.num_dc_groups + 1;
     if (section_id <= ac_global_index) return true;
     const size_t ac_idx = section_id - ac_global_index - 1;
     const size_t acg = ac_idx % frame_dim_.num_groups;
+    const size_t acp = ac_idx / frame_dim_.num_groups;
+    if (acp >= required_passes_) return false;
+    if (!can_skip_ac_groups_) return true;
     return acg < required_ac_groups_.size() && required_ac_groups_[acg] != 0;
   }
 
@@ -198,11 +241,12 @@ class FrameDecoder {
   RegionDecodeStats GetRegionDecodeStats() const;
 
   size_t NumCompletePasses() const {
+    if (required_passes_ == 0) return 0;
     if (!can_skip_ac_groups_) {
       return *std::min_element(decoded_passes_per_ac_group_.begin(),
                                decoded_passes_per_ac_group_.end());
     }
-    size_t min_passes = frame_header_.passes.num_passes;
+    size_t min_passes = required_passes_;
     for (size_t g = 0; g < decoded_passes_per_ac_group_.size(); ++g) {
       if (required_ac_groups_[g]) {
         min_passes =
@@ -273,9 +317,11 @@ class FrameDecoder {
                       size_t image_buffer_size, size_t xsize, size_t ysize,
                       JxlPixelFormat format, size_t bits_per_sample,
                       bool unpremul_alpha, bool undo_orientation) const {
+    const size_t eff_ds = output_downsampling_ > 1 ? output_downsampling_ : 1;
     dec_state_->width = xsize;
     dec_state_->height = ysize;
     dec_state_->output_region = output_region_;
+    dec_state_->output_downsampling = eff_ds;
     dec_state_->main_output.format = format;
     dec_state_->main_output.bits_per_sample = bits_per_sample;
     dec_state_->main_output.callback = pixel_callback;
@@ -284,7 +330,7 @@ class FrameDecoder {
     const size_t stride_xsize =
         (output_region_.xsize() > 0 && output_region_.ysize() > 0)
             ? output_region_.xsize()
-            : xsize;
+            : DivCeil(xsize, eff_ds);
     dec_state_->main_output.stride = GetStride(stride_xsize, format);
     const jxl::ExtraChannelInfo* alpha =
         decoded_->metadata()->Find(jxl::ExtraChannel::kAlpha);
@@ -299,7 +345,7 @@ class FrameDecoder {
     }
     dec_state_->extra_output.clear();
 #if !JXL_HIGH_PRECISION
-    if (dec_state_->main_output.buffer &&
+    if (eff_ds == 1 && dec_state_->main_output.buffer &&
         (format.data_type == JXL_TYPE_UINT8) && (format.num_channels >= 3) &&
         !dec_state_->unpremul_alpha &&
         (dec_state_->undo_orientation == Orientation::kIdentity) &&
@@ -316,6 +362,7 @@ class FrameDecoder {
 
   void AddExtraChannelOutput(void* buffer, size_t buffer_size, size_t xsize,
                              JxlPixelFormat format, size_t bits_per_sample) {
+    const size_t eff_ds = output_downsampling_ > 1 ? output_downsampling_ : 1;
     ImageOutput out;
     out.format = format;
     out.bits_per_sample = bits_per_sample;
@@ -324,7 +371,7 @@ class FrameDecoder {
     const size_t stride_xsize =
         (output_region_.xsize() > 0 && output_region_.ysize() > 0)
             ? output_region_.xsize()
-            : xsize;
+            : DivCeil(xsize, eff_ds);
     out.stride = GetStride(stride_xsize, format);
     dec_state_->extra_output.push_back(out);
   }
@@ -440,6 +487,11 @@ class FrameDecoder {
   size_t num_required_groups_ = 0;
   size_t num_required_sections_ = 0;
   RegionFallbackReason fallback_reason_ = RegionFallbackReason::kNoRegion;
+
+  size_t output_downsampling_ = 1;
+  ScalePolicy scale_policy_ = ScalePolicy::kFastApproximate;
+  ScaleDecodeMode scale_mode_ = ScaleDecodeMode::kNone;
+  size_t required_passes_ = 0;
 };
 
 }  // namespace jxl

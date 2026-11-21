@@ -347,6 +347,66 @@ Status InvSqueeze(Image &input, const std::vector<SqueezeParams> &parameters,
   return true;
 }
 
+Status PartialInvSqueeze(Image &input,
+                         const std::vector<SqueezeParams> &parameters,
+                         int target_shift, ThreadPool *pool) {
+  if (target_shift <= 0) {
+    return HWY_NAMESPACE::InvSqueeze(input, parameters, pool);
+  }
+  for (int i = static_cast<int>(parameters.size()) - 1; i >= 0; i--) {
+    JXL_RETURN_IF_ERROR(
+        CheckMetaSqueezeParams(parameters[i], input.channel.size()));
+    bool horizontal = parameters[i].horizontal;
+    bool in_place = parameters[i].in_place;
+    uint32_t beginc = parameters[i].begin_c;
+    uint32_t endc = parameters[i].begin_c + parameters[i].num_c - 1;
+    uint32_t offset;
+    if (in_place) {
+      offset = endc + 1;
+    } else {
+      offset = input.channel.size() + beginc - endc - 1;
+    }
+    const bool is_meta = (beginc < input.nb_meta_channels);
+    if (is_meta) {
+      JXL_ENSURE(input.nb_meta_channels > parameters[i].num_c);
+      input.nb_meta_channels -= parameters[i].num_c;
+    }
+
+    for (uint32_t c = beginc; c <= endc; c++) {
+      uint32_t rc = offset + c - beginc;
+      JXL_ENSURE(rc < input.channel.size());
+      const bool need_unsqueeze =
+          is_meta || (horizontal ? (input.channel[c].hshift > target_shift)
+                                 : (input.channel[c].vshift > target_shift));
+      if (!need_unsqueeze) {
+        continue;
+      }
+      if ((input.channel[c].w < input.channel[rc].w) ||
+          (input.channel[c].h < input.channel[rc].h)) {
+        return JXL_FAILURE("Corrupted squeeze transform");
+      }
+      if (horizontal) {
+        if (input.channel[c].h != input.channel[rc].h ||
+            (input.channel[c].w != input.channel[rc].w &&
+             input.channel[c].w != input.channel[rc].w + 1)) {
+          return JXL_FAILURE("Incompatible partial horizontal squeeze size");
+        }
+        JXL_RETURN_IF_ERROR(InvHSqueeze(input, c, rc, pool));
+      } else {
+        if (input.channel[c].w != input.channel[rc].w ||
+            (input.channel[c].h != input.channel[rc].h &&
+             input.channel[c].h != input.channel[rc].h + 1)) {
+          return JXL_FAILURE("Incompatible partial vertical squeeze size");
+        }
+        JXL_RETURN_IF_ERROR(InvVSqueeze(input, c, rc, pool));
+      }
+    }
+    input.channel.erase(input.channel.begin() + offset,
+                        input.channel.begin() + offset + (endc - beginc + 1));
+  }
+  return true;
+}
+
 }  // namespace HWY_NAMESPACE
 }  // namespace jxl
 HWY_AFTER_NAMESPACE();
@@ -359,6 +419,14 @@ HWY_EXPORT(InvSqueeze);
 Status InvSqueeze(Image &input, const std::vector<SqueezeParams> &parameters,
                   ThreadPool *pool) {
   return HWY_DYNAMIC_DISPATCH(InvSqueeze)(input, parameters, pool);
+}
+
+HWY_EXPORT(PartialInvSqueeze);
+Status PartialInvSqueeze(Image &input,
+                         const std::vector<SqueezeParams> &parameters,
+                         int target_shift, ThreadPool *pool) {
+  return HWY_DYNAMIC_DISPATCH(PartialInvSqueeze)(input, parameters,
+                                                 target_shift, pool);
 }
 
 void DefaultSqueezeParameters(std::vector<SqueezeParams> *parameters,
