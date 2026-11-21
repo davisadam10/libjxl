@@ -121,11 +121,17 @@ class RenderPipeline {
   virtual void SetRenderRegion(const Rect& unoriented_image_region) {}
   virtual Status RenderOutOfFramePadding(size_t thread_id) { return true; }
 
-  Status FinalizeOutput() {
+  Status FinalizeOutput(bool final_pass = true) {
     for (auto& stage : stages_) {
-      JXL_RETURN_IF_ERROR(stage->FinalizeOutput());
+      JXL_RETURN_IF_ERROR(stage->FinalizeOutput(final_pass));
     }
     return true;
+  }
+
+  void ResetOutputAccumulator() {
+    for (auto& stage : stages_) {
+      stage->ResetOutputAccumulator();
+    }
   }
 
  protected:
