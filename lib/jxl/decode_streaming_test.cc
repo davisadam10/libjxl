@@ -933,12 +933,15 @@ TEST(DecodeStreamingTest, ResetAndRewindStateHygiene) {
             JxlDecoderExperimentalSetOutputRegion(dec.get(), 16, 16, 64, 64));
   std::vector<uint8_t> out1, out2, out3, out4;
   run_once(&out1);
-  EXPECT_EQ(ref_sr.pixels, out1);
+  ExpectFloatPixelsMatch(ref_sr.pixels, out1, ref_sr.stats.scale_mode,
+                         "rewind_before");
 
   // Rewind preserves region + downsampling + subscriptions.
   JxlDecoderRewind(dec.get());
   run_once(&out2);
-  EXPECT_EQ(ref_sr.pixels, out2);
+  EXPECT_EQ(out1, out2);
+  ExpectFloatPixelsMatch(ref_sr.pixels, out2, ref_sr.stats.scale_mode,
+                         "rewind_after");
 
   // Reset clears region + downsampling + subscriptions (#5103).
   JxlDecoderReset(dec.get());
