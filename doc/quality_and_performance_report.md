@@ -92,6 +92,17 @@ All 4 release branches were built in `RelWithDebInfo` with Ninja and benchmarked
 | **`exp/v0.12.0`** | 465.1 ms | **159.3 ms** (2.9×) | **342.4 ms** (1.4×) | **51.3 ms** (**9.1×**) | **181.4 ms** (2.6×) |
 | **`exp/v0.13.0`** | 457.6 ms | **151.2 ms** (3.0×) | **358.1 ms** (1.3×) | **52.1 ms** (**8.8×**) | **184.9 ms** (2.5×) |
 
+### 4.4 Cross-Version Encoded File Size Comparison
+*Raw uncompressed 8K RGB `FLOAT16` footprint: `199,065,600 B` (189.84 MiB) for 7680×4320 and `212,336,640 B` (202.50 MiB) for 8192×4320.*
+
+| Branch | 8K Lossless ACES HALF (Modular) | 8K Progressive VarDCT (16.5 MB test) | 8K Progressive VarDCT (`pread()` plate) | Delta vs `v0.11.1` |
+|---|---|---|---|---|
+| **`exp/v0.11.1`** | 161,059,762 B (153.60 MiB) | 16,512,430 B (15.75 MiB) | 3,206,346 B (3.06 MiB) | baseline |
+| **`exp/v0.11.2`** | 161,059,762 B (153.60 MiB) | 16,512,430 B (15.75 MiB) | 3,206,346 B (3.06 MiB) | **0 B** (bit-identical) |
+| **`exp/v0.12.0`** | 161,059,762 B (153.60 MiB) | 16,512,357 B (15.75 MiB) | 3,206,318 B (3.06 MiB) | 0 B lossless / **-28 to -73 B** VarDCT (-0.001%) |
+| **`exp/v0.13.0`** | 161,059,762 B (153.60 MiB) | 16,512,334 B (15.75 MiB) | 3,206,295 B (3.06 MiB) | 0 B lossless / **-51 to -96 B** VarDCT (-0.002%) |
+
 ### Key Takeaways
+- **File size parity across `v0.11.1` → `v0.13.0` is essentially identical**: Lossless Modular is **byte-for-byte identical** across all 4 versions, and Progressive VarDCT is within **< 100 bytes (< 0.002%)** on multi-megabyte 8K frames (slightly smaller in `v0.12.0`/`v0.13.0` due to minor header/entropy refinements).
 - **ROI & Downscaling dominate wall-clock speedups (8.8×–136.7×)** on every version, before even counting the eliminated full-8K post-processing resize/crop time, ~200–400 MB 8K buffer allocation, and 7×–126× lower NAS/S3 storage I/O.
 - **Upgrading from `v0.11.x` to `v0.12.0`/`v0.13.0`** adds ~9% faster full-frame 8K lossless Modular decode, ~11% faster sparse ROI (`11.6 ms` → `10.3 ms`), blue-noise 8-bit dithering, out-of-order `jxlp`, and important Modular/pipeline race & hardening fixes.
