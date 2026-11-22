@@ -284,27 +284,29 @@ cmd_check_upstream() {
 
   ensure_ref_available "$target_ref"
 
-  local tmp_patches
-  tmp_patches="$(mktemp -d /tmp/jxl-check-patches.XXXXXX)"
-  local tmp_wt
-  tmp_wt="$(mktemp -d /tmp/jxl-check-wt.XXXXXX)"
-  rmdir "$tmp_wt"
+  _CHECK_TMP_PATCHES="$(mktemp -d /tmp/jxl-check-patches.XXXXXX)"
+  _CHECK_TMP_WT="$(mktemp -d /tmp/jxl-check-wt.XXXXXX)"
+  rmdir "$_CHECK_TMP_WT"
 
   cleanup_check() {
-    git -C "$REPO_ROOT" worktree remove --force "$tmp_wt" >/dev/null 2>&1 || rm -rf "$tmp_wt"
-    rm -rf "$tmp_patches"
+    if [[ -n "${_CHECK_TMP_WT:-}" ]]; then
+      git -C "$REPO_ROOT" worktree remove --force "$_CHECK_TMP_WT" >/dev/null 2>&1 || rm -rf "$_CHECK_TMP_WT"
+    fi
+    if [[ -n "${_CHECK_TMP_PATCHES:-}" ]]; then
+      rm -rf "$_CHECK_TMP_PATCHES"
+    fi
   }
   trap cleanup_check EXIT
 
-  cmd_export_patches "" "$tmp_patches"
+  cmd_export_patches "" "$_CHECK_TMP_PATCHES"
   echo "[check-upstream] Creating temporary detached worktree at '$target_ref'..."
-  git worktree add --detach "$tmp_wt" "$target_ref"
+  git worktree add --detach "$_CHECK_TMP_WT" "$target_ref"
 
   echo "[check-upstream] Testing 'git am --3way' against '$target_ref'..."
   set +e
   (
-    cd "$tmp_wt"
-    git am --3way "$tmp_patches"/*.patch
+    cd "$_CHECK_TMP_WT"
+    git am --3way "$_CHECK_TMP_PATCHES"/*.patch
   )
   local am_rc=$?
   set -e
@@ -312,12 +314,12 @@ cmd_check_upstream() {
   if [[ "$am_rc" -ne 0 ]]; then
     echo "[check-upstream] FAIL: Patch stack does NOT apply cleanly to '$target_ref'."
     echo "[check-upstream] Conflicting files:"
-    (cd "$tmp_wt" && git diff --name-only --diff-filter=U || true)
+    (cd "$_CHECK_TMP_WT" && git diff --name-only --diff-filter=U || true)
     return 2
   fi
 
   local decode_h_diff
-  decode_h_diff="$(git -C "$tmp_wt" diff --stat "$target_ref" -- lib/include/jxl/decode.h)"
+  decode_h_diff="$(git -C "$_CHECK_TMP_WT" diff --stat "$target_ref" -- lib/include/jxl/decode.h)"
   if [[ -n "$decode_h_diff" ]]; then
     echo "[check-upstream] FAIL: lib/include/jxl/decode.h was modified!" >&2
     return 1
@@ -328,7 +330,7 @@ cmd_check_upstream() {
   if [[ "$do_build" -eq 1 ]]; then
     echo "[check-upstream] Initializing submodules and running experimental test build..."
     (
-      cd "$tmp_wt"
+      cd "$_CHECK_TMP_WT"
       git submodule update --init --recursive
       cmake -B build-check -G Ninja \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
