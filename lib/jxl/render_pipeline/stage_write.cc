@@ -106,13 +106,27 @@ VFromD<Rebind<T, DF>> MakeUnsigned(VFromD<DF> v, size_t x0, size_t y0,
   v = Mul(v, mul);
   // TODO(veluca): if constexpr with C++17
   if (sizeof(T) == 1) {
-    size_t pos = (y0 % 8) * (2 * 8) + (x0 % 8);
+    const size_t lanes = Lanes(DF());
+    if (x0 % lanes == 0) {
+      size_t pos = (y0 % 8) * (2 * 8) + (x0 % 8);
 #if HWY_TARGET != HWY_SCALAR
-    auto dither = LoadDup128(DF(), kDither + pos);
+      auto dither = LoadDup128(DF(), kDither + pos);
 #else
-    auto dither = LoadU(DF(), kDither + pos);
+      auto dither = LoadU(DF(), kDither + pos);
 #endif
-    v = Add(v, dither);
+      v = Add(v, dither);
+    } else {
+      // On v0.11, LoadDup128 repeats 4 floats per 128-bit lane, so full-image
+      // (x0 = 0, lanes, 2*lanes, ...) applies period 4 when lanes > 4 and
+      // period 8 when lanes <= 4. Match that exact per-pixel phase for ROI.
+      const size_t period = (lanes > 4) ? 4 : 8;
+      const size_t row_base = (y0 % 8) * (2 * 8);
+      alignas(64) float d_arr[HWY_MAX_LANES_D(DF)];
+      for (size_t k = 0; k < lanes; ++k) {
+        d_arr[k] = kDither[row_base + ((x0 + k) % period)];
+      }
+      v = Add(v, LoadU(DF(), d_arr));
+    }
   }
   v = Clamp(Zero(DF()), v, mul);
   return DemoteTo(DU(), NearestInt(v));
