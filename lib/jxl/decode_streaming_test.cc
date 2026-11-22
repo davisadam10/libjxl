@@ -14,6 +14,7 @@
 #include <jxl/thread_parallel_runner.h>
 #include <jxl/thread_parallel_runner_cxx.h>
 #include <jxl/types.h>
+#include <jxl/version.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -219,11 +220,13 @@ std::vector<uint8_t> EncodeJxl(const void* pixels, size_t pixel_bytes,
                   fs, JXL_ENC_FRAME_SETTING_QPROGRESSIVE_AC,
                   opts.qprogressive_ac));
   }
+#if JPEGXL_NUMERIC_VERSION >= JPEGXL_COMPUTE_NUMERIC_VERSION(0, 12, 0)
   if (opts.output_mode >= 0) {
     EXPECT_EQ(JXL_ENC_SUCCESS,
               JxlEncoderFrameSettingsSetOption(
                   fs, JXL_ENC_FRAME_SETTING_OUTPUT_MODE, opts.output_mode));
   }
+#endif
 
   JxlPixelFormat fmt = {3, data_type, JXL_NATIVE_ENDIAN, 0};
   EXPECT_EQ(JXL_ENC_SUCCESS,
@@ -747,11 +750,18 @@ TEST(DecodeStreamingTest, ContainerLayoutsAndEncoderOutputModes) {
   auto src = GenerateSmoothRgb8(W, H);
 
   // 1) Raw, jxlc, and Encoder OUTPUT_MODE 0, 1, 2.
+#if JPEGXL_NUMERIC_VERSION >= JPEGXL_COMPUTE_NUMERIC_VERSION(0, 12, 0)
   for (int mode : {0, 1, 2}) {
     EncodeOpts opts;
     opts.distance = 1.0f;
     opts.output_mode = mode;
     opts.use_container = (mode == 2);
+#else
+  for (int mode : {0, 2}) {
+    EncodeOpts opts;
+    opts.distance = 1.0f;
+    opts.use_container = (mode == 2);
+#endif
     auto jxl = EncodeJxl(src.data(), src.size(), W, H, JXL_TYPE_UINT8, opts);
 
     const std::vector<StreamTarget> targets = {
