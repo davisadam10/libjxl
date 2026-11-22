@@ -285,14 +285,14 @@ class WriteToOutputStage : public RenderPipelineStage {
     }
     const size_t rw = unoriented_scaled_region_.xsize();
     const size_t rh = unoriented_scaled_region_.ysize();
-    float chunk_buf[4][kChunkSize];
+    float chunk_buf[4][kMaxPixelsPerCall];
     for (size_t sy_rel = 0; sy_rel < rh; ++sy_rel) {
       const size_t sy_abs = unoriented_scaled_region_.y0() + sy_rel;
       const size_t fy0 = sy_abs * downsampling_;
       const size_t tile_h = std::min(height_, fy0 + downsampling_) - fy0;
       const size_t ypos = flip_y_ ? (scaled_height_ - 1u - sy_abs) : sy_abs;
-      for (size_t sx_rel = 0; sx_rel < rw; sx_rel += kChunkSize) {
-        const size_t len = std::min<size_t>(kChunkSize, rw - sx_rel);
+      for (size_t sx_rel = 0; sx_rel < rw; sx_rel += kMaxPixelsPerCall) {
+        const size_t len = std::min<size_t>(kMaxPixelsPerCall, rw - sx_rel);
         const size_t xstart = unoriented_scaled_region_.x0() + sx_rel;
         for (size_t i = 0; i < len; ++i) {
           const size_t sx_abs = xstart + i;

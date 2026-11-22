@@ -217,6 +217,7 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
     JXL_RETURN_IF_ERROR(builder.AddStage(GetWriteToImageBundleStage(
         &frame_storage_for_referencing, output_encoding_info)));
   }
+  }  // !use_native_scaled
 
   bool has_alpha = false;
   size_t alpha_c = 0;
@@ -227,7 +228,6 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
       break;
     }
   }
-  }  // !use_native_scaled
 
   const Rect unoriented_scaled_region = ComputeUnorientedRegion(
       output_region, scaled_w, scaled_h, undo_orientation);
