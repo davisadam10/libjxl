@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <functional>
+#include <map>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -1237,10 +1238,12 @@ JxlDecoderStatus JxlDecoderExperimentalSetOutputRegion(JxlDecoder* dec,
   if (width == 0 || height == 0) {
     return JXL_API_ERROR("Output region width and height must be non-zero");
   }
-  size_t x1 = 0;
-  size_t y1 = 0;
-  if (!jxl::SafeAdd<size_t>(x, width, x1) ||
-      !jxl::SafeAdd<size_t>(y, height, y1)) {
+  uint64_t x1 = 0;
+  uint64_t y1 = 0;
+  if (!jxl::SafeAdd(static_cast<uint64_t>(x), static_cast<uint64_t>(width),
+                    x1) ||
+      !jxl::SafeAdd(static_cast<uint64_t>(y), static_cast<uint64_t>(height),
+                    y1)) {
     return JXL_API_ERROR("Output region coordinates overflow");
   }
   if (dec->got_basic_info &&
@@ -1390,7 +1393,8 @@ JxlDecoderStatus JxlDecoderExperimentalSetInputAtOffset(JxlDecoder* dec,
 
     auto& entry = dec->sparse_sections[i];
     if (entry.data.empty()) {
-      if (!dec->CanAddBuffer(dec->sparse_bytes_buffered + sec_size)) {
+      constexpr size_t kMaxSparseBufferBytes = 1024ull * 1024ull * 1024ull;
+      if (dec->sparse_bytes_buffered + sec_size > kMaxSparseBufferBytes) {
         return JXL_API_ERROR("Sparse input buffer limit exceeded");
       }
       entry.data.resize(sec_size);
@@ -1891,7 +1895,6 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
       dec->frame_data_file_offset_valid =
           !dec->have_container || (memcmp(dec->box_type, "jxlc", 4) == 0) ||
           (memcmp(dec->box_type, "jxlp", 4) == 0 &&
-           dec->jxlp_ooo_buffer.empty() &&
            (dec->box_contents_unbounded ||
             dec->frame_data_file_offset + dec->remaining_frame_size <=
                 dec->box_contents_end));
