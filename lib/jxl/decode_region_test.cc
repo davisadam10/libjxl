@@ -115,6 +115,7 @@ struct EncodeConfig {
   int resampling = -1;
   int progressive_ac = -1;
   int group_order = -1;  // 0 = scanline, 1 = center-first (permuted TOC)
+  int palette_colors = -1;
   JxlOrientation orientation = JXL_ORIENT_IDENTITY;
   bool use_container = false;
 };
@@ -209,6 +210,16 @@ std::vector<uint8_t> EncodeJxl(const std::vector<uint8_t>& pixels, size_t width,
               JxlEncoderFrameSettingsSetOption(
                   frame_settings, JXL_ENC_FRAME_SETTING_GROUP_ORDER,
                   cfg.group_order));
+  }
+  if (cfg.palette_colors >= 0) {
+    EXPECT_EQ(JXL_ENC_SUCCESS,
+              JxlEncoderFrameSettingsSetOption(
+                  frame_settings, JXL_ENC_FRAME_SETTING_PALETTE_COLORS,
+                  cfg.palette_colors));
+    EXPECT_EQ(JXL_ENC_SUCCESS,
+              JxlEncoderFrameSettingsSetFloatOption(
+                  frame_settings,
+                  JXL_ENC_FRAME_SETTING_CHANNEL_COLORS_GLOBAL_PERCENT, 0.0f));
   }
 
   JxlPixelFormat format = {num_channels, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
@@ -984,6 +995,7 @@ TEST(DecodeRegionTest, ModularGroupIndependentAndSqueezeFallback) {
     cfg.lossless = true;
     cfg.modular = true;
     cfg.responsive = 0;
+    cfg.palette_colors = 0;
     auto jxl = EncodeJxl(src, w, h, 4, cfg);
     auto full = DecodeJxl(jxl, format, false, 0, 0, 0, 0);
     auto reg = DecodeJxl(jxl, format, true, 200, 220, 256, 256, 4096, false,
